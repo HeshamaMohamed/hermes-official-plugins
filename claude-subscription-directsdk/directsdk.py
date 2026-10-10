@@ -907,7 +907,8 @@ class Client:
             spawn = True
         else:
             spawn = False
-        done = yielded = False
+        done = yielded = lossy = False
+        results, rewritten = {}, {}
         try:
             if not spawn:
                 n = len(session.consumed)
@@ -937,6 +938,11 @@ class Client:
                 elif kind == 'result':
                     final = event
                     break
+                elif kind == 'user' and results:
+                    # Native echoes each MCP result as it entered its own history.
+                    for block in event.get('message', {}).get('content') or []:
+                        if isinstance(block, dict) and block.get('type') == 'tool_result' and block.get('tool_use_id') in results:
+                            rewritten[block['tool_use_id']] = _native_text(block.get('content'))
                 elif kind == 'stream_event':
                     native = event['event']
                     delta = native.get('delta', {})
@@ -971,6 +977,10 @@ class Client:
             poisoned = refused or bool(admission.denied or native_error) or (final is not None and (final.get('is_error') or final.get('subtype') != 'success'))
             if poisoned and not refused and not admission.denied:
                 raise ClaudeAPIError('Native API error: ' + (native_error or str(final.get('subtype'))), NATIVE_ERROR_STATUS.get(str(native_error_code)))
+            # Native persisted or truncated a result it got over MCP: its history keeps that rewrite, so answer, then replay
+            # next step. Intact results in another order are unrestored too, and stay warm.
+            lossy = bool(admission.unrestored) and any(not text.startswith(results[i][0]) for i, text in rewritten.items())
+            poisoned = poisoned or lossy
             blocks = assistant['content']
             calls = []
             for block in blocks:
@@ -1014,8 +1024,8 @@ class Client:
             response = obj({'id': assistant.get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
             chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier], **({'refusal': message['refusal']} if refused else {})}, finish, normalized_usage)
             chunk._response = response
-            _warm_log.info('warm step: session=%s mode=%s upstream=%d denied=%d wall=%.2fs in=%d cache_read=%d cache_write=%d out=%d thinking=%d calls=%d stop=%s id=%s',
-                           session.ident[:8] + ':' + str(session.pid), how, int(admission.used), admission.denied, time.monotonic() - started,
+            _warm_log.info('warm step: session=%s mode=%s upstream=%d denied=%d unrestored=%d wall=%.2fs in=%d cache_read=%d cache_write=%d out=%d thinking=%d calls=%d stop=%s id=%s',
+                           session.ident[:8] + ':' + str(session.pid), how, int(admission.used), admission.denied, bool(admission.unrestored), time.monotonic() - started,
                            usage['input_tokens'], usage.get('cache_read_input_tokens', 0), usage.get('cache_creation_input_tokens', 0), usage['output_tokens'], thinking, len(calls), assistant.get('stop_reason'), assistant.get('id'))
             # Settle before the final yield: a caller closing the stream after it must not kill a healthy session.
             session.detach(request)
@@ -1044,7 +1054,7 @@ class Client:
         finally:
             if session is not None and not done:
                 session.detach(request)
-                _warm_discard(session)
+                _warm_discard(session, 'native-rewrote-tool-result' if lossy else 'step-failed-or-poisoned')
             with self._lock:
                 self._requests.discard(request)
 
@@ -1102,6 +1112,12 @@ class Client:
 # ---------------------------------------------------------------------------------------------
 WARM_IDLE_SECONDS = float(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_IDLE_SECONDS') or 600)
 WARM_POOL_SIZE = int(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_POOL') or 8)
+# Native persists an MCP result longer than the tool's maxResultSizeChars (UTF-16 units; 50,000 for an MCP tool
+# without _meta) under <config>/projects/.../tool-results and keeps a ~2 KB <persisted-output> stub in its history.
+# _meta raises the limit up to native's hard ceiling (500,000 in 2.1.285). Longer results, and is_error results native
+# middle-truncates past 11,024 chars, go through a full replay instead; the margin covers a CLI that wraps the text.
+WARM_RESULT_CHARS = 500_000
+WARM_RESULT_SAFE, WARM_ERROR_SAFE = WARM_RESULT_CHARS - 5_000, 10_000
 _warm_log = logging.getLogger(__name__)
 _warm_lock = threading.Lock()
 _warm_pool = []
@@ -1135,6 +1151,18 @@ def _warm_expects(expect, suffix):
         return all(m.get('role') == 'user' for m in suffix)
     return (len(suffix) == len(expect) and all(m.get('role') == 'tool' and isinstance(m.get('content'), str) for m in suffix)
             and {m.get('tool_call_id') for m in suffix} == expect)
+
+
+def _warm_oversize(message):
+    """A Hermes tool result native would not keep verbatim if it arrived as an MCP reply (it measures UTF-16 units)."""
+    content, limit = message['content'], WARM_ERROR_SAFE if message.get('is_error') else WARM_RESULT_SAFE
+    return len(content) > limit or (2 * len(content) > limit and len(content.encode('utf-16-le', 'surrogatepass')) // 2 > limit)
+
+
+def _native_text(content):
+    if isinstance(content, str):
+        return content
+    return ''.join(b.get('text', '') for b in content or [] if isinstance(b, dict) and b.get('type') == 'text')
 
 
 class WarmSession:
@@ -1197,7 +1225,7 @@ class WarmSession:
             if method == 'initialize':
                 result = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'hermes', 'version': '1'}}
             elif method == 'tools/list':
-                result = {'tools': self.manifest}
+                result = {'tools': [dict(tool, _meta={'anthropic/maxResultSizeChars': WARM_RESULT_CHARS}) for tool in self.manifest]}
             self._reply(request_id, {'jsonrpc': '2.0', 'id': message['id'], 'result': result} if 'id' in message else {'jsonrpc': '2.0', 'result': {}})
 
     def _reply(self, request_id, mcp_response):
@@ -1254,7 +1282,7 @@ class WarmSession:
 
 def _warm_checkout(ident, keys, messages, first):
     """The idle session whose consumed history prefixes this request and expects its suffix, marked busy."""
-    now, stale, matches, how = time.monotonic(), [], [], 'cold'
+    now, stale, matches, how, oversize = time.monotonic(), [], [], 'cold', None
     with _warm_lock:
         for session in list(_warm_pool):
             if session.busy:
@@ -1270,14 +1298,18 @@ def _warm_checkout(ident, keys, messages, first):
                 stale.append(session)
                 how = 'rebuild:' + why
         found = matches[0] if len(matches) == 1 else None
-        if found is not None:
+        if found is not None and found.expect != 'user' and any(_warm_oversize(m) for m in messages[len(found.consumed):]):
+            # Answered over MCP, native would rewrite this result (a stub, or a cut error): replay the history on a new native.
+            stale.append(found)
+            found, how, oversize = None, 'rebuild:oversize', found
+        elif found is not None:
             found.busy, how = True, 'reused'
         elif matches:
             how = 'rebuild:ambiguous'  # never pick by pool order; replay instead
         for session in stale:
             _warm_pool.remove(session)
     for session in stale:
-        session.kill('stale-or-diverged')
+        session.kill('tool-result-over-mcp-limit' if session is oversize else 'stale-or-diverged')
     return found, how
 
 
@@ -1340,11 +1372,11 @@ def _warm_cancel_owned(client):
         s.kill('cancelled-while-parked')
 
 
-def _warm_discard(session):
+def _warm_discard(session, reason='step-failed-or-poisoned'):
     with _warm_lock:
         if session in _warm_pool:
             _warm_pool.remove(session)
-    session.kill('step-failed-or-poisoned')
+    session.kill(reason)
 
 
 def _warm_reap():
