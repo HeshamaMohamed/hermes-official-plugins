@@ -19,9 +19,25 @@ NATIVE = r'''
 import json, os, sys, urllib.request
 with open(os.environ['SPAWNS'], 'a') as f:
     f.write(json.dumps({'pid': os.getpid(), 'argv': sys.argv[1:]}) + '\n')
-history, queue, rpc, answered = [], [], [0], {}
+history, queue, rpc, answered, limits = [], [], [0], {}, {}
 def out(row):
     print(json.dumps(row), flush=True)
+def persist(block, result):
+    # 2.1.285: an MCP result past the tool's limit (UTF-16 units) is written under the config dir and replaced by a stub
+    # in native's history; an error result past 11,024 chars is middle-truncated. FAKE_PERSIST_LIMIT stands in for a CLI
+    # that persists below what tools/list advertised.
+    text = ''.join(b['text'] for b in result['content'] if b['type'] == 'text')
+    size = len(text.encode('utf-16-le', 'surrogatepass')) // 2
+    if result.get('isError') and size > 11024:
+        return text[:5000] + '\n... [%d characters truncated] ...\n' % (len(text) - 10000) + text[-5000:]
+    if size <= int(os.environ.get('FAKE_PERSIST_LIMIT') or limits.get(block['name'], 50000)):
+        return result['content']
+    config = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.environ['HOME'], '.claude')
+    path = os.path.join(config, 'projects', os.getcwd().replace(os.sep, '-'), 'session-%d' % os.getpid(), 'tool-results', block['id'] + '.json')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(result['content'], f)
+    return '<persisted-output>\nOutput too large (%dKB). Full output saved to: %s\n\nPreview (first 2KB):\n%s\n...\n</persisted-output>' % (size // 1000, path, text[:2000])
 def call_next():
     block = queue[0]
     rpc[0] += 1
@@ -36,6 +52,8 @@ def wire():
             messages[-1]['content'] += message['content']
         else:
             messages.append(message)
+    if os.environ.get('FAKE_REVERSE'):
+        messages[-1]['content'].reverse()  # intact results, forwarded in another order
     if not os.environ.get('NATIVE_CONTEXT'):
         return messages
     reminder, newest = '\n<system-reminder>userEmail: user@example.com</system-reminder>', messages[-1]['content']
@@ -85,10 +103,18 @@ for line in sys.stdin:
     row = json.loads(line)
     if row['type'] == 'control_request':
         out({'type':'control_response','response':{'subtype':'success','request_id':row['request_id'],'response':{}}})
+        out({'type':'control_request','request_id':'list','request':{'subtype':'mcp_message','server_name':'hermes','message':{'jsonrpc':'2.0','id':0,'method':'tools/list'}}})
+    elif row['type'] == 'control_response' and row['response']['request_id'] == 'list':
+        # Without _meta an MCP tool persists past min(100,000, 50,000); _meta counts up to the 500,000 ceiling.
+        for tool in row['response']['response']['mcp_response']['result']['tools']:
+            meta = (tool.get('_meta') or {}).get('anthropic/maxResultSizeChars')
+            limits['mcp__hermes__' + tool['name']] = min(meta, 500000) if isinstance(meta, (int, float)) and meta > 0 else 50000
     elif row['type'] == 'control_response':
         result = row['response']['response']['mcp_response']['result']
         block = queue.pop(0)
-        history.append({'role':'user','content':[{'type':'tool_result','tool_use_id':block['id'],'content':result['content']}]})
+        content = persist(block, result)
+        history.append({'role':'user','content':[{'type':'tool_result','tool_use_id':block['id'],'content':content, **({'is_error':True} if result.get('isError') else {})}]})
+        out({'type':'user','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':block['id'],'content':content}]},'tool_use_result':result['content']})
         if queue:
             call_next()
         else:
@@ -761,3 +787,100 @@ def test_cancelled_warm_failure_never_falls_back(warm, tmp_path, monkeypatch, ca
         step(client, [{'role': 'user', 'content': 'hello'}])
     assert not warm.upstream.bodies and not warm.spawned() and not directsdk._warm_pool
     assert 'warm fallback' not in caplog.text and 'warm kill' in caplog.text
+
+
+# ---- large tool results: native 2.1.285 persists an MCP result past the tool's limit and keeps a stub ----
+
+def persisted(tmp_path):
+    return sorted(str(p) for p in tmp_path.rglob('tool-results/*'))
+
+
+def tool_round(warm, big, is_error=False):
+    """A parallel round answered with one large result and one small one; returns the history and the step's response."""
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(warm.client(), messages)
+    calls = first.choices[0].message.tool_calls
+    messages += [as_history(first), {'role': 'tool', 'tool_call_id': calls[0].id, 'content': big, **({'is_error': True} if is_error else {})},
+                 {'role': 'tool', 'tool_call_id': calls[1].id, 'content': 'small'}]
+    sent = len(warm.upstream.bodies)
+    response = step(warm.client(), messages)
+    return messages, response, sent
+
+
+def upstream_results(body):
+    return [(b['content'] if isinstance(b['content'], str) else ''.join(x['text'] for x in b['content'])).split('\n<system-reminder>')[0]
+            for m in body['messages'] if isinstance(m['content'], list) for b in m['content'] if b.get('type') == 'tool_result']
+
+
+@pytest.mark.parametrize('size', [49_999, 50_001, 100_000, directsdk.WARM_RESULT_SAFE])
+def test_large_results_reach_upstream_intact_over_mcp(warm, tmp_path, size):
+    """tools/list advertises anthropic/maxResultSizeChars, so a result past native's 50,000 default is not persisted."""
+    big = ''.join('line %06d of a large tool result\n' % i for i in range(size // 31 + 1))[:size]
+    messages, response, sent = tool_round(warm, big)
+    admission = response.usage.model_dump()['native_admission']
+    assert admission['warm'] == 'reused' and 'unrestored' not in admission
+    assert len(warm.upstream.bodies) == sent + 1 and upstream_results(warm.upstream.bodies[-1]) == [big, 'small']
+    assert response.choices[0].message.content == 'got ' + big + '+small'
+    assert not persisted(tmp_path) and len(warm.spawned()) == 1
+    # The session stays warm with Hermes' text in its own history.
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
+    assert upstream_results(warm.upstream.bodies[-1]) == [big, 'small']
+
+
+@pytest.mark.parametrize('big, is_error', [('x' * (directsdk.WARM_RESULT_CHARS + 1), False),
+                                           # 250,001 code points are 500,002 UTF-16 units, which is what native counts.
+                                           ('\U0001F600' * (directsdk.WARM_RESULT_CHARS // 2 + 1), False),
+                                           ('E' * 20_000, True)], ids=['over-ceiling', 'over-ceiling-in-utf16', 'long-error'])
+def test_a_result_native_would_rewrite_is_replayed_on_a_new_native(warm, tmp_path, caplog, big, is_error):
+    """Never delivered over MCP: the parked session is killed and the step replays the history, one upstream request."""
+    caplog.set_level('INFO', logger=directsdk.__name__)
+    messages, response, sent = tool_round(warm, big, is_error)
+    admission = response.usage.model_dump()['native_admission']
+    assert admission == {'upstream_requests': 1, 'blocked_requests': 0, 'request_id': None, 'warm': 'rebuild:oversize'}
+    assert len(warm.upstream.bodies) == sent + 1 and upstream_results(warm.upstream.bodies[-1]) == [big, 'small']
+    old, new = [s['pid'] for s in warm.spawned()]
+    assert not alive(old) and not persisted(tmp_path)
+    assert 'reason=tool-result-over-mcp-limit' in caplog.text
+    # The rebuilt native holds the full text and serves the next step warm.
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    again = step(warm.client(), messages)
+    assert again.usage.model_dump()['native_admission']['warm'] == 'reused' and len(warm.spawned()) == 2
+    assert upstream_results(warm.upstream.bodies[-1]) == [big, 'small']
+
+
+def test_a_delivered_result_native_rewrote_is_answered_then_replayed(warm, tmp_path, caplog):
+    """Defense in depth: a CLI that persists below the advertised limit costs this step's text, never later steps."""
+    caplog.set_level('INFO', logger=directsdk.__name__)
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    client = warm.client()
+    client.env['FAKE_PERSIST_LIMIT'] = '1000'
+    first = step(client, messages)
+    calls = first.choices[0].message.tool_calls
+    big = 'B' * 2_000
+    messages += [as_history(first), {'role': 'tool', 'tool_call_id': calls[0].id, 'content': big}, {'role': 'tool', 'tool_call_id': calls[1].id, 'content': 'small'}]
+    response = step(warm.client(), messages)
+    admission = response.usage.model_dump()['native_admission']
+    assert admission['warm'] == 'reused' and admission['unrestored']
+    assert response.choices[0].message.content.startswith('got <persisted-output>') and len(persisted(tmp_path)) == 1
+    assert not directsdk._warm_pool and 'unrestored=1' in caplog.text and 'reason=native-rewrote-tool-result' in caplog.text
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    again = step(warm.client(), messages)
+    assert again.usage.model_dump()['native_admission']['warm'] == 'cold'
+    assert upstream_results(warm.upstream.bodies[-1]) == [big, 'small']
+
+
+def test_intact_results_forwarded_in_another_order_stay_warm(warm):
+    """Unrestored alone is no rewrite: the same texts in another order keep the session."""
+    client = warm.client()
+    client.env['FAKE_REVERSE'] = '1'
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(client, messages)
+    calls = first.choices[0].message.tool_calls
+    messages += [as_history(first), {'role': 'tool', 'tool_call_id': calls[0].id, 'content': 'APPLE'}, {'role': 'tool', 'tool_call_id': calls[1].id, 'content': 'BANANA'}]
+    response = step(warm.client(), messages)
+    admission = response.usage.model_dump()['native_admission']
+    assert admission['warm'] == 'reused' and admission['unrestored'] and response.choices[0].message.content == 'got BANANA+APPLE'
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
+    assert len(warm.spawned()) == 1

@@ -96,12 +96,14 @@ It is read for the active profile on every spawn, so it applies to the next requ
 
 Hermes still owns every step. Hermes tools are served to native as an SDK-type MCP server over the stream-json control protocol (`--allowedTools mcp__hermes`, `dontAsk`, no `--max-turns`). A native tool call parks until the next `create()` brings Hermes' result, matched by `toolUseId`. For each step the admission relay is re-armed for exactly one upstream request, under that step's timeout. It anchors on the frame native replays next, so the tool-result restoration, first-turn ordering and breakpoint folding described under "Ownership and replay" apply as they do per call.
 
+Native keeps an MCP result only up to the tool's `maxResultSizeChars`, counted in UTF-16 code units (50,000 for an MCP tool without `_meta`). A longer result is written to `<config dir>/projects/<cwd>/<session>/tool-results/` and replaced in native's history by a ~2 KB `<persisted-output>` preview, for this step and every later one. `tools/list` therefore advertises `_meta["anthropic/maxResultSizeChars"]` = 500,000, the most Claude Code 2.1.285 honours. Native also cuts an `is_error` result past 11,024 characters down to its first and last 5,000. Two cases are never answered over MCP: a result past 495,000 units, and an `is_error` result past 10,000. In either case the parked session is killed (`warm kill: ... reason=tool-result-over-mcp-limit`), and the step replays the full history on a new native (`mode=rebuild:oversize`). That is still one upstream request, the result arrives verbatim, and the new session stays warm for the next step. Native echoes each answered result as it entered its history. If the relay reports `unrestored` (also logged per step as `warm step: ... unrestored=1`) and that echo is not Hermes' text, the step still returns native's answer, which was based on the rewritten result. The session is then killed (`reason=native-rewrote-tool-result`), and the next step replays Hermes' text. Results that are intact but forwarded in another order stay warm.
+
 Sessions live in a process-wide pool and are found by history. Reuse needs a unique exact-prefix match on all of these:
 - native carrier hashes, model, system prompt, tools and generation fields;
 - the resolved CLI and its auth/config environment;
 - the telemetry setting's flags, `DO_NOT_TRACK` and the proxy route.
 
-Anything else kills the session, and the step takes the normal full replay. That includes an ambiguous match, edited or compacted history, `/steer`, a changed setting, a refusal, a tool name outside the inventory, a dead process, or unexpected output. `cancel()` also kills a parked session its client owns.
+Anything else kills the session, and the step takes the normal full replay. That includes an ambiguous match, edited or compacted history, `/steer`, a changed setting, a refusal, a tool name outside the inventory, a tool result native would not keep verbatim (above), a dead process, or unexpected output. `cancel()` also kills a parked session its client owns.
 
 | Variable | Default | Effect |
 |---|---|---|
