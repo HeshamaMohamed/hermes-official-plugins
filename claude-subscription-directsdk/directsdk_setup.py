@@ -56,6 +56,7 @@ def _resolve(command, env):
 PLUGIN_ID = "claude-subscription-directsdk-experimental"
 TELEMETRY_SETTING = "claude_code_telemetry"
 CONFIG_DIR_SETTING = "claude_config_dir"
+WARM_SETTING = "warm_session"
 # Any one of these turns off Claude Code's feature-flag fetch, and with it every model its picker
 # only offers through a flag (#86: 11 models become 5). Off only when the user turns the setting off.
 QUIET_TRAFFIC = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1"}
@@ -88,12 +89,22 @@ def _setting(key, default=None):
     return value
 
 
+def _flag(key, default):
+    """A boolean plugin setting, ``default`` when unset, empty or unreadable."""
+    value = _setting(key)
+    if isinstance(value, str):
+        return value.strip().lower() not in _OFF if value.strip() else default
+    return default if value is None else value is not False and value != 0
+
+
 def telemetry_enabled():
     """The active profile's ``claude_code_telemetry`` plugin setting, default on."""
-    value = _setting(TELEMETRY_SETTING, True)
-    if isinstance(value, str):
-        return value.strip().lower() not in _OFF
-    return value is not False and value != 0
+    return _flag(TELEMETRY_SETTING, True)
+
+
+def warm_session_enabled():
+    """The ``warm_session`` plugin setting, default off; CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM overrides it when set."""
+    return _flag(WARM_SETTING, False)
 
 
 def apply_config_dir(env):

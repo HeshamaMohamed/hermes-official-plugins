@@ -104,7 +104,7 @@ It is read for the active profile on every spawn, so it applies to the next requ
 
 ## Warm native session (opt-in, experimental)
 
-`CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM=1` keeps one native Claude Code process alive per conversation. Without it, every `create()` spawns a fresh process and replays the history. It targets thinking re-derived on every tool round (#97) and per-call spawn latency (#83). It is off by default; with it off, nothing in this section applies.
+The `warm_session` plugin setting (`hermes config set plugins.entries.claude-subscription-directsdk-experimental.settings.warm_session true`, or Desktop → Capabilities → Plugins), or `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM=1`, keeps one native Claude Code process alive per conversation. Without it, every `create()` spawns a fresh process and replays the history. It targets thinking re-derived on every tool round (#97) and per-call spawn latency (#83). It is off by default; with it off, nothing in this section applies.
 
 Hermes still owns every step. Hermes tools are served to native as an SDK-type MCP server over the stream-json control protocol (`--allowedTools mcp__hermes`, `dontAsk`, no `--max-turns`). A native tool call parks until the next `create()` brings Hermes' result, matched by `toolUseId`. For each step the admission relay is re-armed for exactly one upstream request, under that step's timeout. It anchors on the frame native replays next, so the tool-result restoration, first-turn ordering and breakpoint folding described under "Ownership and replay" apply as they do per call.
 
@@ -119,7 +119,7 @@ Anything else kills the session, and the step takes the normal full replay. That
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM` | off | `1` enables warm sessions |
+| `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM` | unset | `1` enables and `0` disables warm sessions, overriding the profile's `warm_session` setting. A multi-profile desktop backend or gateway loads only its launch home's `.env` into the process, so a routed profile turns warm mode on with the setting. |
 | `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_POOL` | `8` | Sessions retained at once. When the pool is full, a step takes the per-call path. |
 | `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_IDLE_SECONDS` | `600` | An idle session is killed after this many seconds. |
 

@@ -223,8 +223,8 @@ def warm(tmp_path):
     env = {'PATH': os.defpath, 'HOME': str(tmp_path), 'ANTHROPIC_BASE_URL': f'http://127.0.0.1:{upstream.server.server_port}',
            'CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM': '1', 'SPAWNS': str(spawns)}
     clients = []
-    def client():
-        clients.append(directsdk.Client(command=[sys.executable, str(native)], env=env, timeout=20))
+    def client(drop=()):
+        clients.append(directsdk.Client(command=[sys.executable, str(native)], env={k: v for k, v in env.items() if k not in drop}, timeout=20))
         return clients[-1]
     def spawned():
         return [json.loads(line) for line in spawns.read_text().splitlines()] if spawns.exists() else []
@@ -884,3 +884,48 @@ def test_intact_results_forwarded_in_another_order_stay_warm(warm):
     messages += [as_history(response), {'role': 'user', 'content': 'next'}]
     assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
     assert len(warm.spawned()) == 1
+
+
+def _set_warm(value):
+    """Write the setting where `hermes config set plugins.entries.<id>.settings.warm_session` puts it."""
+    import directsdk_setup
+    from hermes_cli.config import get_config_path
+    get_config_path().write_text("plugins:\n  enabled: []\n  entries:\n    %s:\n      settings:\n        warm_session: %s\n"
+                                 % (directsdk_setup.PLUGIN_ID, value), encoding='utf-8')
+
+
+@pytest.mark.parametrize('setting, env, expected', [
+    (None, {}, False), ('true', {}, True), ('false', {}, False), ('"on"', {}, True), ("''", {}, False), ('null', {}, False),
+    ('true', {'CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM': '0'}, False), ('false', {'CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM': '1'}, True),
+    ('true', {'CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM': ''}, True)])
+def test_warm_follows_the_profile_setting_unless_the_env_flag_is_set(profile, setting, env, expected):
+    if setting is not None:
+        _set_warm(setting)
+    assert directsdk._warm_enabled(env) is expected
+
+
+def test_each_profile_of_a_multi_profile_process_reads_its_own_warm_setting(profile, tmp_path):
+    """A desktop backend or gateway serving several profiles loads only its launch home's .env: the setting is per profile."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    warm_home = tmp_path / 'warm-profile'
+    warm_home.mkdir()
+    token = set_hermes_home_override(warm_home)
+    try:
+        _set_warm('true')
+        assert directsdk._warm_enabled({}) is True
+    finally:
+        reset_hermes_home_override(token)
+    assert directsdk._warm_enabled({}) is False
+
+
+def test_the_profile_setting_alone_turns_warm_sessions_on(profile, warm):
+    _set_warm('true')
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(warm.client(drop=('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM',)), messages)
+    assert first.usage.model_dump()['native_admission']['warm'] == 'cold'
+    calls = first.choices[0].message.tool_calls
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': c.id[-4:]} for c in calls]
+    second = step(warm.client(drop=('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM',)), messages)
+    assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
+    (spawned,) = warm.spawned()
+    assert spawned['argv'][spawned['argv'].index('--allowedTools') + 1] == 'mcp__hermes'
