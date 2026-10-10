@@ -54,6 +54,7 @@ def _resolve(command, env):
 # config.yaml (plugin.yaml `config_schema`; Desktop → Capabilities → Plugins, or `hermes config set`).
 PLUGIN_ID = "claude-subscription-directsdk-experimental"
 TELEMETRY_SETTING = "claude_code_telemetry"
+WARM_SETTING = "warm_session"
 # Any one of these turns off Claude Code's feature-flag fetch, and with it every model its picker
 # only offers through a flag (#86: 11 models become 5). Off only when the user turns the setting off.
 QUIET_TRAFFIC = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1"}
@@ -65,8 +66,8 @@ ALWAYS_QUIET = {"DISABLE_AUTOUPDATER": "1", "DISABLE_FEEDBACK_COMMAND": "1"}
 _OFF = ("false", "0", "no", "off")
 
 
-def telemetry_enabled():
-    """The ``claude_code_telemetry`` plugin setting, default on.
+def _setting(key, default):
+    """A boolean plugin setting, ``default`` when unset, empty or unreadable.
 
     Read from the active profile's config on every call (``load_config_readonly`` resolves
     ``get_hermes_home()`` per call and caches on the file signature), so a multi-profile gateway
@@ -76,14 +77,24 @@ def telemetry_enabled():
         from hermes_cli.config import load_config_readonly
         value = load_config_readonly()
     except Exception:
-        return True
-    for segment in ("plugins", "entries", PLUGIN_ID, "settings", TELEMETRY_SETTING):
+        return default
+    for segment in ("plugins", "entries", PLUGIN_ID, "settings", key):
         if not isinstance(value, Mapping) or segment not in value:
-            return True
+            return default
         value = value[segment]
     if isinstance(value, str):
-        return value.strip().lower() not in _OFF
-    return value is not False and value != 0
+        return value.strip().lower() not in _OFF if value.strip() else default
+    return default if value is None else value is not False and value != 0
+
+
+def telemetry_enabled():
+    """The ``claude_code_telemetry`` plugin setting, default on."""
+    return _setting(TELEMETRY_SETTING, True)
+
+
+def warm_session_enabled():
+    """The ``warm_session`` plugin setting, default off; CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM overrides it when set."""
+    return _setting(WARM_SETTING, False)
 
 
 def apply_traffic_policy(env, telemetry=None):

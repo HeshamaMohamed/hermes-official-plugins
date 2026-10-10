@@ -27,11 +27,11 @@ from types import SimpleNamespace
 try:
     from .admission import Admission
     from .model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
-    from .directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, QUIET_TRAFFIC, _resolve as resolve_claude, apply_traffic_policy
+    from .directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, QUIET_TRAFFIC, _resolve as resolve_claude, apply_traffic_policy, warm_session_enabled
 except ImportError:
     from admission import Admission
     from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
-    from directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, QUIET_TRAFFIC, _resolve as resolve_claude, apply_traffic_policy
+    from directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, QUIET_TRAFFIC, _resolve as resolve_claude, apply_traffic_policy, warm_session_enabled
 
 
 # Hermes picks retry vs fallback from an error's status_code (main loop and auxiliary ladder alike).
@@ -1057,7 +1057,12 @@ _WARM_LAUNCH_PREFIXES = ('ANTHROPIC_', 'CLAUDE_SUBSCRIPTION_DIRECTSDK_', 'CLAUDE
 
 
 def _warm_enabled(env):
-    return env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM', '').lower() in ('1', 'true', 'yes', 'on')
+    """CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM when set, on or off; otherwise the active profile's warm_session setting.
+
+    A multi-profile desktop backend or gateway loads only its launch home's .env into the process environment,
+    so the setting is how a routed profile turns warm mode on."""
+    value = (env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM') or '').strip().lower()
+    return value in ('1', 'true', 'yes', 'on') if value else warm_session_enabled()
 
 
 def _message_key(message):

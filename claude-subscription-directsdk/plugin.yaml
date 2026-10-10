@@ -26,3 +26,11 @@ config_schema:
       Let Claude Code send its usage telemetry and fetch feature flags. Feature flags unlock newer
       models in the model picker; turn off to keep Claude Code quiet (the picker may then list fewer
       models).
+  warm_session:
+    type: bool
+    default: false
+    label: Warm native session (experimental)
+    description: >-
+      Keep one Claude Code process alive per conversation instead of starting one for every model
+      call, so Claude keeps its thinking between tool rounds and steps start faster. The
+      CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM environment variable overrides this setting when set.
