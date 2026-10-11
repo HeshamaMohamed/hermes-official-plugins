@@ -1111,6 +1111,8 @@ class Client:
 # never by client identity (Hermes builds request-local clients and closes them freely).
 # ---------------------------------------------------------------------------------------------
 WARM_IDLE_SECONDS = float(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_IDLE_SECONDS') or 600)
+# Keep tool-parked sessions below native's 3,900 s clear_tool_uses idle trigger.
+WARM_PARKED_IDLE_SECONDS = float(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_PARKED_IDLE_SECONDS') or 3600)
 WARM_POOL_SIZE = int(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_POOL') or 8)
 # Native persists an MCP result longer than the tool's maxResultSizeChars (UTF-16 units; 50,000 for an MCP tool
 # without _meta) under <config>/projects/.../tool-results and keeps a ~2 KB <persisted-output> stub in its history.
@@ -1118,6 +1120,9 @@ WARM_POOL_SIZE = int(os.environ.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM_POOL') o
 # middle-truncates past 11,024 chars, go through a full replay instead; the margin covers a CLI that wraps the text.
 WARM_RESULT_CHARS = 500_000
 WARM_RESULT_SAFE, WARM_ERROR_SAFE = WARM_RESULT_CHARS - 5_000, 10_000
+# Native's optional per-message tool-result budget (tengu_hawthorn_steeple) counts UTF-16 units.
+WARM_ROUND_CHARS = 200_000
+WARM_ROUND_SAFE = WARM_ROUND_CHARS - 5_000
 _warm_log = logging.getLogger(__name__)
 _warm_lock = threading.Lock()
 _warm_pool = []
@@ -1158,10 +1163,18 @@ def _warm_expects(expect, suffix):
             and {m.get('tool_call_id') for m in suffix} == expect)
 
 
+def _utf16_len(text):
+    return len(text) if text.isascii() else len(text.encode('utf-16-le', 'surrogatepass')) // 2
+
+
 def _warm_oversize(message):
     """A Hermes tool result native would not keep verbatim if it arrived as an MCP reply (it measures UTF-16 units)."""
     content, limit = message['content'], WARM_ERROR_SAFE if message.get('is_error') else WARM_RESULT_SAFE
-    return len(content) > limit or (2 * len(content) > limit and len(content.encode('utf-16-le', 'surrogatepass')) // 2 > limit)
+    return len(content) > limit or (2 * len(content) > limit and _utf16_len(content) > limit)
+
+
+def _warm_idle_limit(session):
+    return WARM_IDLE_SECONDS if session.expect == 'user' else max(WARM_IDLE_SECONDS, WARM_PARKED_IDLE_SECONDS)
 
 
 def _native_text(content):
@@ -1293,7 +1306,7 @@ def _warm_checkout(ident, keys, messages, first):
             if session.busy:
                 continue
             n = len(session.consumed)
-            if not session.alive() or now - session.last_used > WARM_IDLE_SECONDS:
+            if not session.alive() or now - session.last_used > _warm_idle_limit(session):
                 stale.append(session)
             elif session.ident == ident and keys[:n] == session.consumed and _warm_expects(session.expect, messages[n:]):
                 matches.append(session)
@@ -1303,7 +1316,9 @@ def _warm_checkout(ident, keys, messages, first):
                 stale.append(session)
                 how = 'rebuild:' + why
         found = matches[0] if len(matches) == 1 else None
-        if found is not None and found.expect != 'user' and any(_warm_oversize(m) for m in messages[len(found.consumed):]):
+        suffix = messages[len(found.consumed):] if found is not None else []
+        if found is not None and found.expect != 'user' and (any(_warm_oversize(m) for m in suffix)
+                                                           or sum(_utf16_len(m['content']) for m in suffix) > WARM_ROUND_SAFE):
             # Answered over MCP, native would rewrite this result (a stub, or a cut error): replay the history on a new native.
             stale.append(found)
             found, how, oversize = None, 'rebuild:oversize', found
@@ -1320,7 +1335,7 @@ def _warm_checkout(ident, keys, messages, first):
 
 def _warm_trim(room):
     """Evict least-recently-used idle sessions until ``room`` more fit under the cap (caller holds the lock)."""
-    idle = sorted((s for s in _warm_pool if not s.busy), key=lambda s: s.last_used)
+    idle = sorted((s for s in _warm_pool if not s.busy), key=lambda s: (s.expect != 'user', s.last_used))
     evict = idle[:max(0, len(_warm_pool) + room - WARM_POOL_SIZE)]
     for s in evict:
         _warm_pool.remove(s)
@@ -1389,7 +1404,7 @@ def _warm_reap():
         time.sleep(min(30, WARM_IDLE_SECONDS / 2))
         now = time.monotonic()
         with _warm_lock:
-            stale = [s for s in _warm_pool if not s.busy and (not s.alive() or now - s.last_used > WARM_IDLE_SECONDS)]
+            stale = [s for s in _warm_pool if not s.busy and (not s.alive() or now - s.last_used > _warm_idle_limit(s))]
             for s in stale:
                 _warm_pool.remove(s)
         for s in stale:
