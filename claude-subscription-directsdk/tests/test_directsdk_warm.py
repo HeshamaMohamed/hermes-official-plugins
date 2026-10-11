@@ -16,13 +16,13 @@ import directsdk
 # A native that speaks the warm protocol: SDK MCP over control requests, one tool call at a time,
 # a new upstream request after every answered batch, and an idle wait for the next user frame.
 NATIVE = r'''
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 with open(os.environ['SPAWNS'], 'a') as f:
     f.write(json.dumps({'pid': os.getpid(), 'argv': sys.argv[1:]}) + '\n')
 history, queue, rpc, answered, limits = [], [], [0], {}, {}
 def out(row):
     print(json.dumps(row), flush=True)
-def persist(block, result):
+def persist(block, result, force=False):
     # 2.1.285: an MCP result past the tool's limit (UTF-16 units) is written under the config dir and replaced by a stub
     # in native's history; an error result past 11,024 chars is middle-truncated. FAKE_PERSIST_LIMIT stands in for a CLI
     # that persists below what tools/list advertised.
@@ -30,14 +30,35 @@ def persist(block, result):
     size = len(text.encode('utf-16-le', 'surrogatepass')) // 2
     if result.get('isError') and size > 11024:
         return text[:5000] + '\n... [%d characters truncated] ...\n' % (len(text) - 10000) + text[-5000:]
-    if size <= int(os.environ.get('FAKE_PERSIST_LIMIT') or limits.get(block['name'], 50000)):
+    if not force and size <= int(os.environ.get('FAKE_PERSIST_LIMIT') or limits.get(block['name'], 50000)):
         return result['content']
     config = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.environ['HOME'], '.claude')
-    path = os.path.join(config, 'projects', os.getcwd().replace(os.sep, '-'), 'session-%d' % os.getpid(), 'tool-results', block['id'] + '.json')
+    path = os.path.join(config, 'projects', re.sub(r'[^A-Za-z0-9]', '-', os.getcwd()), 'session-%d' % os.getpid(), 'tool-results', block['id'] + '.json')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(result['content'], f)
     return '<persisted-output>\nOutput too large (%dKB). Full output saved to: %s\n\nPreview (first 2KB):\n%s\n...\n</persisted-output>' % (size // 1000, path, text[:2000])
+def round_budget():
+    budget = os.environ.get('FAKE_ROUND_BUDGET')
+    if not budget:
+        return
+    results = []
+    for message in reversed(history):
+        if message['role'] != 'user':
+            break
+        results.extend(b for b in message['content'] if b['type'] == 'tool_result')
+    def text(result):
+        content = result['content']
+        return content if isinstance(content, str) else ''.join(b['text'] for b in content if b['type'] == 'text')
+    def size(result):
+        return len(text(result).encode('utf-16-le', 'surrogatepass')) // 2
+    total = sum(size(result) for result in results)
+    for result in sorted(results, key=size, reverse=True):
+        if total <= int(budget):
+            break
+        before = size(result)
+        result['content'] = persist({'id':result['tool_use_id']}, {'content':[{'type':'text','text':text(result)}]}, force=True)
+        total += size(result) - before
 def call_next():
     block = queue[0]
     rpc[0] += 1
@@ -118,6 +139,7 @@ for line in sys.stdin:
         if queue:
             call_next()
         else:
+            round_budget()  # Native's aggregate rewrite happens AFTER its stdout echoes.
             query()
     elif row['type'] in ('user', 'assistant'):
         history.append(row['message'])
@@ -812,7 +834,69 @@ def upstream_results(body):
             for m in body['messages'] if isinstance(m['content'], list) for b in m['content'] if b.get('type') == 'tool_result']
 
 
-@pytest.mark.parametrize('size', [49_999, 50_001, 100_000, directsdk.WARM_RESULT_SAFE])
+def test_a_tool_round_over_the_message_budget_is_replayed_not_answered_over_mcp(warm, tmp_path, caplog):
+    caplog.set_level('INFO', logger=directsdk.__name__)
+    client = warm.client()
+    client.env['FAKE_ROUND_BUDGET'] = '200000'
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(client, messages)
+    # Each has 100,000 characters but 100,001 UTF-16 units: the fake's strict >200,000 budget fires.
+    texts = [letter * 99_999 + '\U0001F600' for letter in ('A', 'B')]
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': call.id, 'content': text}
+                                     for call, text in zip(first.choices[0].message.tool_calls, texts)]
+    sent = len(warm.upstream.bodies)
+    old = warm.spawned()[0]['pid']
+    response = step(warm.client(), messages)
+    admission = response.usage.model_dump()['native_admission']
+    results = upstream_results(warm.upstream.bodies[-1])
+    assert {'mode': admission['warm'], 'full_texts': results == texts,
+            'stub': any('<persisted-output>' in result for result in results)} == {
+                'mode': 'rebuild:oversize', 'full_texts': True, 'stub': False}
+    assert admission['upstream_requests'] == 1 and len(warm.upstream.bodies) == sent + 1
+    assert not alive(old) and len(warm.spawned()) == 2 and not persisted(tmp_path)
+    assert 'reason=tool-result-over-mcp-limit' in caplog.text
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
+    assert len(warm.spawned()) == 2 and upstream_results(warm.upstream.bodies[-1]) == texts
+
+
+def test_a_session_parked_on_a_long_tool_survives_the_idle_limit(warm, monkeypatch):
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(warm.client(), messages)
+    old = warm.spawned()[0]['pid']
+    monkeypatch.setattr(directsdk, 'WARM_IDLE_SECONDS', 0.2)
+    monkeypatch.setattr(directsdk, 'WARM_PARKED_IDLE_SECONDS', 3600, raising=False)
+    time.sleep(0.25)
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': call.id, 'content': 'result'}
+                                     for call in first.choices[0].message.tool_calls]
+    response = step(warm.client(), messages)
+    assert response.usage.model_dump()['native_admission']['warm'] == 'reused'
+    assert alive(old) and len(warm.spawned()) == 1
+    # Settled user-idle sessions still expire at the shorter limit.
+    time.sleep(0.25)
+    messages += [as_history(response), {'role': 'user', 'content': 'next'}]
+    assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] != 'reused'
+    assert not alive(old) and len(warm.spawned()) == 2
+
+
+def test_lru_evicts_a_user_idle_session_before_a_tool_parked_one(warm, monkeypatch):
+    monkeypatch.setattr(directsdk, 'WARM_POOL_SIZE', 2)
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(warm.client(), messages)
+    (parked,) = directsdk._warm_pool
+    step(warm.client(), [{'role': 'user', 'content': 'idle conversation'}])
+    idle = next(session for session in directsdk._warm_pool if session is not parked)
+    # Explicit ordering avoids relying on clock resolution or launch timing.
+    parked.last_used, idle.last_used = time.monotonic() - 1, time.monotonic()
+    step(warm.client(), [{'role': 'user', 'content': 'third conversation'}])
+    assert parked.alive() and not idle.alive() and len(directsdk._warm_pool) == 2
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': call.id, 'content': 'result'}
+                                     for call in first.choices[0].message.tool_calls]
+    assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
+    assert len(warm.spawned()) == 3
+
+
+@pytest.mark.parametrize('size', [49_999, 50_001, 100_000, directsdk.WARM_ROUND_SAFE - len('small')])
 def test_large_results_reach_upstream_intact_over_mcp(warm, tmp_path, size):
     """tools/list advertises anthropic/maxResultSizeChars, so a result past native's 50,000 default is not persisted."""
     big = ''.join('line %06d of a large tool result\n' % i for i in range(size // 31 + 1))[:size]
