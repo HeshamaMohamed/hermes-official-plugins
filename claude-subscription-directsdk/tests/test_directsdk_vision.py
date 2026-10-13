@@ -53,7 +53,11 @@ def should_route_capture_to_aux_vision(provider, model, cfg):
     return not _native_tool_result_images(provider, model, cfg)
 
 
-def test_routing_consumers_follow_the_declaration(profile):
+def test_routing_consumers_follow_the_declaration(profile, monkeypatch):
+    # The aggregator check looks the plugin id up in models.dev, which has no entry for it: an empty registry
+    # gives the same "not an aggregator" answer without the network download the lookup otherwise does.
+    import agent.models_dev
+    monkeypatch.setattr(agent.models_dev, 'fetch_models_dev', lambda *args, **kwargs: {})
     # computer_use screenshots stay on the main model only for declared ids.
     assert should_route_capture_to_aux_vision(profile.name, 'claude-opus-5-5[1m]', {}) is False
     assert should_route_capture_to_aux_vision(profile.name, 'unpinned-future-model', {}) is True

@@ -339,7 +339,8 @@ def test_upstream_closed_never_passes_a_socket_that_is_still_open():
         verdict, done = [], threading.Event()
         watcher = threading.Thread(target=lambda: (verdict.append(upstream_closed(rfile)), done.set()), daemon=True)
         watcher.start()
-        assert not done.wait(0.5)  # Open and silent: never reported closed.
+        # upstream_closed has no timer of its own: a wrong verdict on a silent socket returns at once, well inside 0.1 s.
+        assert not done.wait(0.1)  # Open and silent: never reported closed.
         left.sendall(b'x')
         assert done.wait(5) and verdict == [False]  # Open and talking: not closed either.
         watcher.join(5)
@@ -406,7 +407,7 @@ def test_silent_upstream_fails_fast_instead_of_hanging(tmp_path, monkeypatch):
     within the idle bound, not wait out the request timeout while Hermes sees nothing."""
     import time
     import admission
-    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', 1)
+    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', .2)
     release = threading.Event()
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -433,7 +434,7 @@ def test_pings_keep_a_slow_upstream_alive(tmp_path, monkeypatch):
     """Long thinking streams only pings for a while; bytes inside the idle bound must never fail it."""
     import time
     import admission
-    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', 1)
+    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', .2)
     usage = {'input_tokens':0, 'output_tokens':0}
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -442,8 +443,8 @@ def test_pings_keep_a_slow_upstream_alive(tmp_path, monkeypatch):
             self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
             send = lambda e: (self.wfile.write(('data: '+json.dumps(e)+'\n\n').encode()), self.wfile.flush())
             send({'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[],'usage':usage}})
-            for _ in range(6):  # 3 s of pings, three times the patched idle bound
-                time.sleep(.5); send({'type':'ping'})
+            for _ in range(6):  # 0.6 s of pings, three times the patched idle bound; each gap half of it
+                time.sleep(.1); send({'type':'ping'})
             send({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})
             send({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':'FIRST'}})
             send({'type':'content_block_stop','index':0})
