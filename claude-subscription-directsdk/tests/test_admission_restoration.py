@@ -333,7 +333,8 @@ for line in sys.stdin:
 results = [b for b in messages[-1]['content'] if b.get('type') == 'tool_result']
 if results:
     for b in results:
-        b['content'] = [{'type': 'text', 'text': b['content']},
+        text = b['content'] if isinstance(b['content'], str) else ''.join(x['text'] for x in b['content'])
+        b['content'] = [{'type': 'text', 'text': text},
                         {'type': 'text', 'text': ' native synthetic reminder'}]
         b['is_error'] = False
     results[-1]['cache_control'] = {'type': 'ephemeral', 'ttl': '1h'}
