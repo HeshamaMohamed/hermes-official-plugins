@@ -61,6 +61,9 @@ def _isolated_hermes_home(tmp_path_factory, monkeypatch):
     one-shot fakes down the warm path, where each waits out its full timeout. A test that needs its own home
     sets it with monkeypatch after this runs (``profile`` does)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("isolated-hermes-home")))
+    # The same for the environment switch: a caller exporting CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM=1 would send the
+    # per-call fakes down the warm path. Warm tests set it on their own clients.
+    monkeypatch.delenv("CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM", raising=False)
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -81,3 +84,21 @@ def _fast_server_stop():
     socketserver.BaseServer.serve_forever = serve_forever
     yield
     socketserver.BaseServer.serve_forever = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_server_name_lookup():
+    """HTTPServer.server_bind sets ``server_name`` with a reverse DNS lookup (``socket.getfqdn``), about 1 ms on
+    each of the ~340 servers the suite starts. Nothing here reads ``server_name``; bind and listen are unchanged."""
+    import http.server
+    import socketserver
+
+    original = http.server.HTTPServer.server_bind
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+    http.server.HTTPServer.server_bind = server_bind
+    yield
+    http.server.HTTPServer.server_bind = original

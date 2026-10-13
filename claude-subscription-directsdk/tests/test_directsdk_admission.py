@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -332,18 +333,35 @@ def test_upstream_closed_sees_a_real_reset():
             assert upstream_closed(rfile) is True
 
 
+class _SilentSocketWatch:
+    """An open, silent socket under upstream_closed, started when this module is imported.
+
+    The silent window must outlast any timer a future upstream_closed might add (at least WINDOW seconds).
+    Starting it at import lets the tests that run first fill that window, so the test waits only for what is left."""
+    WINDOW = 0.5
+
+    def __init__(self):
+        import socket
+        self.left, self.right = socket.socketpair()
+        self.rfile = self.right.makefile('rb')
+        self.verdict, self.done = [], threading.Event()
+        self.started = time.monotonic()
+        self.watcher = threading.Thread(target=lambda: (self.verdict.append(upstream_closed(self.rfile)), self.done.set()), daemon=True)
+        self.watcher.start()
+
+
+_SILENT = _SilentSocketWatch()
+
+
 def test_upstream_closed_never_passes_a_socket_that_is_still_open():
-    import socket
-    left, right = socket.socketpair()
-    with left, right, right.makefile('rb') as rfile:
-        verdict, done = [], threading.Event()
-        watcher = threading.Thread(target=lambda: (verdict.append(upstream_closed(rfile)), done.set()), daemon=True)
-        watcher.start()
-        # upstream_closed has no timer of its own: a wrong verdict on a silent socket returns at once, well inside 0.1 s.
-        assert not done.wait(0.1)  # Open and silent: never reported closed.
-        left.sendall(b'x')
-        assert done.wait(5) and verdict == [False]  # Open and talking: not closed either.
-        watcher.join(5)
+    watch = _SILENT
+    with watch.left, watch.right, watch.rfile:
+        # Open and silent for at least WINDOW since import: never reported closed.
+        assert not watch.done.wait(max(0, watch.WINDOW - (time.monotonic() - watch.started)))
+        assert time.monotonic() - watch.started >= watch.WINDOW
+        watch.left.sendall(b'x')
+        assert watch.done.wait(5) and watch.verdict == [False]  # Open and talking: not closed either.
+        watch.watcher.join(5)
 
 
 def test_incomplete_upstream_error_names_the_first_attempt(tmp_path):
