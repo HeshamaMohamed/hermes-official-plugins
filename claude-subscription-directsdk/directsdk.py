@@ -166,8 +166,11 @@ def prepare_history(messages, names=None):
                 blocks.append({'type': 'tool_use', 'id': call['id'], 'name': name, 'input': call['input']})
         elif role == 'tool':
             role = 'user'
+            content = message.get('content')
+            # A result native got over MCP lives in its history as one text block; a replay sends that same form,
+            # so a fresh native's prefix equals the live native's. Empty text stays a string (the API refuses empty blocks).
             blocks = [{'type': 'tool_result', 'tool_use_id': message['tool_call_id'],
-                       'content': message.get('content') if isinstance(message.get('content'), str) else content_blocks(message.get('content'))}]
+                       'content': ([{'type': 'text', 'text': content}] if content else content) if isinstance(content, str) else content_blocks(content)}]
             if message.get('is_error') is not None:
                 blocks[0]['is_error'] = bool(message['is_error'])
         elif role == 'user':
@@ -1065,7 +1068,9 @@ class Client:
         env.update(MCP_TOOL_TIMEOUT='86400000', MAX_MCP_OUTPUT_TOKENS='100000000')
         # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
         session.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
-        session.admission.reorder_first = False  # PR #29 review: warm skips the #77 first-turn reorder
+        # A live native keeps its launch context where it first put it; the relay moves it after the newest frame on
+        # every request, where a fresh native replaying this history puts it, so a rebuild reads this native's cache.
+        session.admission.float_context = True
         env['ANTHROPIC_BASE_URL'] = session.admission.url
         (root / 'settings.json').write_text(json.dumps({'env': {'CLAUDE_CODE_EXTRA_BODY': body}}), encoding='utf-8')
         (root / 'system.md').write_text(system, encoding='utf-8')

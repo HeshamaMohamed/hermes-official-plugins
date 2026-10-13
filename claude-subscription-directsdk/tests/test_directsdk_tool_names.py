@@ -59,7 +59,7 @@ def test_short_names_preserve_literal_wire_manifest_and_history():
         '["",[{"type":"user","message":{"role":"user","content":[{"type":"text","text":"go"}]}},'
         '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Calling."},'
         '{"type":"tool_use","id":"t1","name":"mcp__hermes__probe","input":{}}]}},'
-        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}]]'
+        '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"ok"}]}]}}]]'
     )
 
 

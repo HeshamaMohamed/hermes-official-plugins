@@ -170,6 +170,82 @@ def _keep_turn_mark(body, messages, last, target):
     return True
 
 
+def float_native_context(payload, queried, recorded):
+    """Put native's per-process context after the newest frame, where a fresh native replaying the same history puts it.
+
+    A native keeps the context it built for its first request where it first put it, for its whole life: the date
+    line (inside the environment ``role: system`` message on turn 1, or its own ``role: system`` message after the
+    frame it was launched on) and the account reminder blocks it prepended to that frame. A fresh native replaying
+    the same history sends that context only after the newest frame. The two prefixes split at the launch frame, so a
+    rebuild never reads the cache of the native it replaces.
+
+    Every ``role: system`` message leaves the history and returns as one trailing system message, its texts joined
+    with a blank line (native's own join); a mark on any of them stays on that message. ``recorded`` is ``None`` on
+    a native's first request: then the text blocks native put before the queried frame are recorded (plain form).
+    On every request the recorded blocks ahead of the queried frame, and each one that occurs exactly once in an
+    earlier user message (the launch frame as native replays it), move to the end of the newest user message. Nothing is added, dropped or edited. Returns ``(payload, recorded)``; a payload that does not
+    parse, or holds a system message that is not plain text, forwards as is."""
+    try:
+        body = json.loads(payload)
+        messages = body['messages']
+        if recorded is None:
+            recorded, newest = [], {}
+            for m in reversed(messages):
+                if m.get('role') == 'user':
+                    newest = m
+                    break
+                if m.get('role') != 'system':
+                    break
+            content = newest.get('content')
+            if isinstance(content, list) and queried:
+                want = [_plain(b) for b in queried]
+                starts = [k for k in range(len(content) - len(queried) + 1)
+                          if [_plain(b) for b in content[k:k + len(queried)]] == want]
+                if len(starts) == 1 and all(isinstance(b, dict) and b.get('type') == 'text' for b in content[:starts[0]]):
+                    recorded = [_plain(b) for b in content[:starts[0]]]
+        system = [m for m in messages if m.get('role') == 'system']
+        rest = [m for m in messages if m.get('role') != 'system']
+        texts, mark = [], None
+        for m in system:
+            content = m.get('content')
+            blocks = [{'type': 'text', 'text': content}] if isinstance(content, str) else content
+            if not isinstance(blocks, list) or not all(isinstance(b, dict) and b.get('type') == 'text' and set(b) <= {'type', 'text', 'cache_control'} for b in blocks):
+                return payload, recorded
+            for b in blocks:
+                texts.append(b['text'])
+                mark = mark or b.get('cache_control')
+        if not rest or rest[-1].get('role') != 'user' or not isinstance(rest[-1].get('content'), list):
+            return payload, recorded
+        newest = rest[-1]['content']
+        moved = []
+        # Recorded blocks native put ahead of the newest frame (its launch request) go behind it.
+        if queried and recorded:
+            want = [_plain(b) for b in queried]
+            starts = [k for k in range(len(newest) - len(queried) + 1)
+                      if [_plain(b) for b in newest[k:k + len(queried)]] == want]
+            if len(starts) == 1 and starts[0] > 0 and all(_plain(b) in recorded for b in newest[:starts[0]]):
+                moved, newest[:] = newest[:starts[0]], newest[starts[0]:]
+        # A recorded block in an earlier turn (the launch frame, replayed as native built it) moves too.
+        for block in recorded:
+            spots = [(m, j) for m in rest[:-1] if m.get('role') == 'user' and isinstance(m.get('content'), list)
+                     for j, b in enumerate(m['content']) if _plain(b) == block]
+            if len(spots) == 1 and len(spots[0][0]['content']) > 1:
+                m, j = spots[0]
+                moved.append(m['content'].pop(j))
+        if not system and not moved:
+            return payload, recorded
+        newest.extend(moved)
+        if system:
+            trailing = {'type': 'text', 'text': '\n\n'.join(texts)}
+            if mark:
+                trailing['cache_control'] = mark
+            rest.append({'role': 'system', 'content': [trailing]})
+        body['messages'] = rest
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), recorded
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return payload, recorded
+
+
 def pin_message_breakpoint(payload, queried, reorder_first=True):
     """Keep the recurring message ``cache_control`` on content the next request replays unchanged.
 
@@ -478,7 +554,8 @@ class _Server(HTTPServer):
 
 
 class Admission:
-    # A warm session sets this False: its live native replays the first turn exactly as it built it.
+    # A warm session sets this True: its live native keeps its launch context where it first put it (float_native_context).
+    float_context = False
     reorder_first = True
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
@@ -503,6 +580,7 @@ class Admission:
         self.unrestored = None
         self.capture = Capture()
         self.error_body = b''
+        self.context = None  # float_native_context's record of this native's launch context; kept across rearm
         self.prefix = '/admit/' + secrets.token_urlsafe(32)
         self.server = _Server(('127.0.0.1', 0), Handler)
         self.server.admission = self
@@ -585,6 +663,10 @@ class Handler(BaseHTTPRequestHandler):
                 # exactly as native built it (the pre-restoration behaviour), so a CLI that
                 # reshapes its tool results degrades to an uncached tail, never a failed turn.
                 gate.unrestored = str(exc)
+            if gate.float_context:
+                # After restoration, which anchors on native's own layout; before pinning, which then keeps the
+                # breakpoint ahead of the moved context.
+                payload, gate.context = float_native_context(payload, gate.queried, gate.context)
             payload = pin_message_breakpoint(payload, gate.queried, gate.reorder_first)
             target = gate.upstream
             if target.scheme == 'https':
