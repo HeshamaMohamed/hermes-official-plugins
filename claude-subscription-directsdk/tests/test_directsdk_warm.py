@@ -180,7 +180,7 @@ def sse(message_id, blocks, stop, details=None):
 class Upstream:
     """Answers the newest native message: a user text asks for two parallel probe calls, tool results get echoed."""
     def __init__(self, hang=None):
-        self.bodies, self.hang = [], hang or threading.Event()
+        self.bodies, self.hang, self.release = [], hang or threading.Event(), threading.Event()
         outer = self
         class Peer(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -196,7 +196,7 @@ class Upstream:
                 last = messages[-1]
                 content = last['content'] if isinstance(last['content'], list) else [{'type': 'text', 'text': last['content']}]
                 if 'slow' in content[0].get('text', ''):
-                    time.sleep(1.5)
+                    outer.release.wait(10)  # busy until the test lets it go
                 results = [b for m in messages[-2:] for b in (m['content'] if isinstance(m['content'], list) else []) if b.get('type') == 'tool_result']
                 n = len(outer.bodies)
                 text = ''.join(b.get('text', '') for b in content if b.get('type') == 'text')
@@ -496,6 +496,8 @@ def test_r9_pool_cap_holds_with_busy_sessions(warm, monkeypatch):
         while not warm.upstream.bodies and time.monotonic() < deadline:
             time.sleep(.02)
         other = step(warm.client(), [{'role': 'user', 'content': 'hi'}])
+        assert not slow.done(), 'the slow conversation must still hold its slot while the other one runs'
+        warm.upstream.release.set()
         assert slow.result(timeout=20).choices[0].message.content == 'echo slow hi'
     assert other.choices[0].message.content == 'echo hi'
     assert 'warm' not in other.usage.model_dump()['native_admission']
@@ -887,16 +889,16 @@ def test_a_session_parked_on_a_long_tool_survives_the_idle_limit(warm, monkeypat
     messages = [{'role': 'user', 'content': 'call probe in parallel'}]
     first = step(warm.client(), messages)
     old = warm.spawned()[0]['pid']
-    monkeypatch.setattr(directsdk, 'WARM_IDLE_SECONDS', 0.2)
+    monkeypatch.setattr(directsdk, 'WARM_IDLE_SECONDS', 0.05)
     monkeypatch.setattr(directsdk, 'WARM_PARKED_IDLE_SECONDS', 3600, raising=False)
-    time.sleep(0.25)
+    time.sleep(0.06)
     messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': call.id, 'content': 'result'}
                                      for call in first.choices[0].message.tool_calls]
     response = step(warm.client(), messages)
     assert response.usage.model_dump()['native_admission']['warm'] == 'reused'
     assert alive(old) and len(warm.spawned()) == 1
     # Settled user-idle sessions still expire at the shorter limit.
-    time.sleep(0.25)
+    time.sleep(0.06)
     messages += [as_history(response), {'role': 'user', 'content': 'next'}]
     assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] != 'reused'
     assert not alive(old) and len(warm.spawned()) == 2

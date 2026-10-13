@@ -64,13 +64,13 @@ assert len(pathlib.Path(sys.argv[sys.argv.index('--system-prompt-file')+1]).read
 for line in sys.stdin: pass
 for i in range(8):
  print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'x'}}}),flush=True)
- time.sleep(.1)
+ time.sleep(.05)
 print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'x'*8}],'id':'m','stop_reason':'end_turn'}}),flush=True)
 print(json.dumps({'type':'stream_event','event':{'type':'message_stop'}}),flush=True)
 print(json.dumps({'type':'result','subtype':'success','usage':{'input_tokens':1,'output_tokens':8}}),flush=True)
 ''')
     client = native.Client(command=[sys.executable, str(script)], env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CLAUDE_CODE_EFFORT_LEVEL": "max"})
-    request = dict(model="sonnet", messages=[{"role": "system", "content": "s" * 150000}, {"role": "user", "content": "go"}], tools=[{"type": "function", "function": {"name": "probe", "description": "d" * 150000}}], temperature=.3, top_p=.9, extra_body={"reasoning": {"effort": "minimal"}}, timeout=SimpleNamespace(read=.5), stream=True)
+    request = dict(model="sonnet", messages=[{"role": "system", "content": "s" * 150000}, {"role": "user", "content": "go"}], tools=[{"type": "function", "function": {"name": "probe", "description": "d" * 150000}}], temperature=.3, top_p=.9, extra_body={"reasoning": {"effort": "minimal"}}, timeout=SimpleNamespace(read=.25), stream=True)
     try:
         chunks = list(client.create(**request))
         assert "".join(c.choices[0].delta.content or "" for c in chunks) == "x" * 8
