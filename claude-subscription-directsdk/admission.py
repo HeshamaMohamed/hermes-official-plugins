@@ -170,7 +170,7 @@ def _keep_turn_mark(body, messages, last, target):
     return True
 
 
-def pin_message_breakpoint(payload, queried):
+def pin_message_breakpoint(payload, queried, reorder_first=True):
     """Keep the recurring message ``cache_control`` on content the next request replays unchanged.
 
     Native attaches per-request context (today's date, the account-email reminder, whatever a
@@ -200,7 +200,9 @@ def pin_message_breakpoint(payload, queried):
     try:
         body = json.loads(payload)
         messages = body['messages']
-        reordered = _frame_first(messages, queried)
+        # A warm native replays its first turn exactly as it first built it (reminder first), so moving the
+        # reminder on request 1 would break the prefix request 2 replays (PR #29 review): warm skips it.
+        reordered = _frame_first(messages, queried) if reorder_first else False
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
@@ -216,6 +218,10 @@ def pin_message_breakpoint(payload, queried):
                     break
                 prefix.append((last + 1, j, sent))
             rest = newest['content'][len(prefix):]
+            if not reorder_first and last < 0:
+                # Warm first turn: the live native replays this whole message unchanged, so it is all stable.
+                prefix = [(last + 1, j, b) for j, b in enumerate(newest['content'])]
+                rest = []
             if not (rest and isinstance(rest[0], dict) and rest[0].get('type') == 'tool_result'):
                 stable += prefix
         target = next(((i, j, b) for i, j, b in reversed(stable)
@@ -472,6 +478,8 @@ class _Server(HTTPServer):
 
 
 class Admission:
+    # A warm session sets this False: its live native replays the first turn exactly as it built it.
+    reorder_first = True
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
         self.queried = queried
@@ -577,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
                 # exactly as native built it (the pre-restoration behaviour), so a CLI that
                 # reshapes its tool results degrades to an uncached tail, never a failed turn.
                 gate.unrestored = str(exc)
-            payload = pin_message_breakpoint(payload, gate.queried)
+            payload = pin_message_breakpoint(payload, gate.queried, gate.reorder_first)
             target = gate.upstream
             if target.scheme == 'https':
                 if gate.proxy:

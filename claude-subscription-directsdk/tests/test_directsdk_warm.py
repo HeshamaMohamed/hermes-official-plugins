@@ -80,6 +80,9 @@ def wire():
     reminder, newest = '\n<system-reminder>userEmail: user@example.com</system-reminder>', messages[-1]['content']
     if len(messages) == 1:
         newest.insert(0, {'type':'text','text':reminder})
+        if len(history) == 1 and history[0]['role'] == 'user':
+            # A live native keeps the first turn as it built it: later requests replay the reminder first.
+            history[0] = {'role':'user','content':[{'type':'text','text':reminder}] + (history[0]['content'] if isinstance(history[0]['content'], list) else [{'type':'text','text':history[0]['content']}])}
     elif newest[-1]['type'] == 'tool_result':
         if isinstance(newest[-1]['content'], str):
             newest[-1]['content'] += reminder
@@ -728,8 +731,8 @@ def test_warm_steps_get_mains_restoration_and_breakpoint_pinning(warm):
     messages = [{'role': 'user', 'content': 'call probe in parallel'}]
     first = step(context_client(warm), messages)
     calls = first.choices[0].message.tool_calls
-    # #77: the opening frame goes ahead of native's prepended reminder, so the next request replays it.
-    assert [b['text'] for b in warm.upstream.bodies[0]['messages'][0]['content']] == ['call probe in parallel', REMINDER]
+    # A warm native keeps its prepended reminder first on every later request, so the relay leaves that order.
+    assert [b['text'] for b in warm.upstream.bodies[0]['messages'][0]['content']] == [REMINDER, 'call probe in parallel']
     messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': k} for c, k in zip(calls, ('APPLE', 'BANANA'))]
     second = step(context_client(warm), messages)
     assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
@@ -1013,3 +1016,17 @@ def test_the_profile_setting_alone_turns_warm_sessions_on(profile, warm):
     assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
     (spawned,) = warm.spawned()
     assert spawned['argv'][spawned['argv'].index('--allowedTools') + 1] == 'mcp__hermes'
+
+
+def test_warm_request_two_replays_the_first_turn_as_request_one_forwarded_it(warm):
+    """PR #29 review: the #77 first-turn reorder must not run on a warm session. A live native replays its first
+    turn with the reminder first; reordering request 1 alone made request 2 miss the cache and re-write it all."""
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(context_client(warm), messages)
+    calls = first.choices[0].message.tool_calls
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': k} for c, k in zip(calls, ('APPLE', 'BANANA'))]
+    second = step(context_client(warm), messages)
+    assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
+    one, two = warm.upstream.bodies[0], warm.upstream.bodies[1]
+    plain = lambda m: [{k: v for k, v in b.items() if k != 'cache_control'} for b in m['content']]
+    assert plain(two['messages'][0]) == plain(one['messages'][0])
