@@ -407,6 +407,26 @@ def test_interleaved_conversations_keep_separate_natives(warm):
 
 
 
+def test_a_review_on_another_model_coexists_with_the_chat_it_forks(warm):
+    """A background review forks the chat's history on another model: neither native evicts the other."""
+    chat = [{'role': 'user', 'content': 'hi'}]
+    chat.append(as_history(step(warm.client(), chat)))
+    chat_session = directsdk._warm_pool[0]
+    modes = []
+    for turn in range(2):
+        # Same first message, different ident (model): the review gets its own native and the chat's survives.
+        review = chat + [{'role': 'user', 'content': f'review {turn}'}]
+        modes.append(warm.client().create(model='opus', messages=review, tools=TOOLS).usage.model_dump()['native_admission']['warm'])
+        chat.append({'role': 'user', 'content': f'chat {turn}'})
+        result = step(warm.client(), chat)
+        modes.append(result.usage.model_dump()['native_admission']['warm'])
+        chat.append(as_history(result))
+    # The chat native served every chat turn; the second review replaced only the first review's native (same ident).
+    assert modes == ['cold', 'reused', 'rebuild:prefix', 'reused']
+    assert len(warm.spawned()) == 3 and chat_session.alive()
+
+
+
 # ---- Codex review (v2): each test reproduces one finding at 4f8016d ----
 
 LAUNCHER = 'import subprocess, sys\nsys.exit(subprocess.call([sys.executable] + sys.argv[1:]))\n'

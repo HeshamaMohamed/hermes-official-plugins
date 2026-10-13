@@ -1239,9 +1239,10 @@ def _warm_checkout(ident, keys, messages, first):
                 stale.append(session)
             elif session.ident == ident and keys[:n] == session.consumed and _warm_expects(session.expect, messages[n:]):
                 matches.append(session)
-            elif first is not None and session.first == first:
-                # This conversation diverged (compaction, edit, interrupt, changed prompt/tools/model).
-                why = 'ident' if session.ident != ident else ('prefix' if keys[:n] != session.consumed else 'suffix')
+            elif first is not None and (session.ident, session.first) == (ident, first):
+                # This conversation diverged (compaction, edit, interrupt). Pool key is (ident, first): a native of
+                # another ident (a review forking this chat on another model) coexists; idle reaper and LRU retire it.
+                why = 'prefix' if keys[:n] != session.consumed else 'suffix'
                 stale.append(session)
                 how = 'rebuild:' + why
         found = matches[0] if len(matches) == 1 else None
