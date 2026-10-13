@@ -334,7 +334,8 @@ def test_divergence_kills_the_session_and_replays_full_history(warm):
     # The rebuild replayed the full (edited) history: every tool result's text, not an excerpt.
     replayed = warm.upstream.bodies[-1]['messages']
     results = [b for m in replayed if isinstance(m['content'], list) for b in m['content'] if b.get('type') == 'tool_result']
-    assert [r['content'] for r in results] == ['[compacted] R0', 'R1' * 50]
+    # A replayed result has the one-text-block form native keeps from an MCP reply.
+    assert [r['content'] for r in results] == [[{'type': 'text', 'text': '[compacted] R0'}], [{'type': 'text', 'text': 'R1' * 50}]]
     # The rebuilt session is warm again for the next step.
     messages += [as_history(third), {'role': 'user', 'content': 'again'}]
     assert step(warm.client(), messages).usage.model_dump()['native_admission']['warm'] == 'reused'
@@ -751,8 +752,8 @@ def test_warm_steps_get_mains_restoration_and_breakpoint_pinning(warm):
     messages = [{'role': 'user', 'content': 'call probe in parallel'}]
     first = step(context_client(warm), messages)
     calls = first.choices[0].message.tool_calls
-    # A warm native keeps its prepended reminder first on every later request, so the relay leaves that order.
-    assert [b['text'] for b in warm.upstream.bodies[0]['messages'][0]['content']] == [REMINDER, 'call probe in parallel']
+    # The relay puts the reminder native prepended to its launch frame behind it, on this and every later request.
+    assert [b['text'] for b in warm.upstream.bodies[0]['messages'][0]['content']] == ['call probe in parallel', REMINDER]
     messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': k} for c, k in zip(calls, ('APPLE', 'BANANA'))]
     second = step(context_client(warm), messages)
     assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
@@ -760,7 +761,9 @@ def test_warm_steps_get_mains_restoration_and_breakpoint_pinning(warm):
     # Native's reminder is not forwarded as tool output; the trailing context mark moves onto the last result (#33).
     assert tool_round['messages'][2]['content'] == [
         {'type': 'tool_result', 'tool_use_id': calls[0].id, 'content': [{'type': 'text', 'text': 'APPLE'}]},
-        {'type': 'tool_result', 'tool_use_id': calls[1].id, 'content': [{'type': 'text', 'text': 'BANANA'}], 'cache_control': MARK}]
+        {'type': 'tool_result', 'tool_use_id': calls[1].id, 'content': [{'type': 'text', 'text': 'BANANA'}], 'cache_control': MARK},
+        {'type': 'text', 'text': REMINDER}]
+    assert tool_round['messages'][0]['content'] == [{'type': 'text', 'text': 'call probe in parallel'}]
     assert message_marks(tool_round) == [(1, 1), (2, 1)]
     messages += [as_history(second), {'role': 'user', 'content': 'next turn'}]
     third = step(context_client(warm), messages)
@@ -783,8 +786,32 @@ def test_a_cold_launch_on_a_tool_result_frame_restores_hermes_results(warm):
     second = step(context_client(warm), messages)
     assert second.usage.model_dump()['native_admission']['warm'] == 'cold' and len(warm.spawned()) == 2
     assert warm.upstream.bodies[-1]['messages'][2]['content'] == [
-        {'type': 'tool_result', 'tool_use_id': calls[0].id, 'content': 'APPLE'},
-        {'type': 'tool_result', 'tool_use_id': calls[1].id, 'content': 'BANANA', 'cache_control': MARK}]
+        {'type': 'tool_result', 'tool_use_id': calls[0].id, 'content': [{'type': 'text', 'text': 'APPLE'}]},
+        {'type': 'tool_result', 'tool_use_id': calls[1].id, 'content': [{'type': 'text', 'text': 'BANANA'}], 'cache_control': MARK}]
+
+
+def test_a_rebuilt_native_replays_the_live_natives_cached_prefix(warm):
+    """A fresh native replaying a history sends the prefix the live native it replaces sent, through its last
+    breakpoint: native's launch context sits after the newest frame and replayed tool results have the form an MCP
+    reply left in the live native's history. Before, the rebuild read only tools and system."""
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    first = step(context_client(warm), messages)
+    calls = first.choices[0].message.tool_calls
+    messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': k} for c, k in zip(calls, ('APPLE', 'BANANA'))]
+    second = step(context_client(warm), messages)
+    messages += [as_history(second), {'role': 'user', 'content': 'next turn'}]
+    live = step(context_client(warm), messages)
+    assert live.usage.model_dump()['native_admission']['warm'] == 'reused'
+    directsdk._warm_shutdown()
+    fresh = step(context_client(warm), messages)
+    assert fresh.usage.model_dump()['native_admission']['warm'] == 'cold' and len(warm.spawned()) == 2
+    old, new = warm.upstream.bodies[2], warm.upstream.bodies[3]
+    mark = message_marks(old)[-1]
+    # This fake keeps its own assistant turns in a reduced form (empty tool input), unlike real native and
+    # the carrier replay; the context and tool results this test is about live in the other messages.
+    def turns(body):
+        return [m if m['role'] != 'assistant' else m['role'] for m in json.loads(prefix(body, mark))]
+    assert turns(new) == turns(old)
 
 
 # ---- v8: review of PR #99 ----
@@ -1048,5 +1075,6 @@ def test_warm_request_two_replays_the_first_turn_as_request_one_forwarded_it(war
     second = step(context_client(warm), messages)
     assert second.usage.model_dump()['native_admission']['warm'] == 'reused'
     one, two = warm.upstream.bodies[0], warm.upstream.bodies[1]
-    plain = lambda m: [{k: v for k, v in b.items() if k != 'cache_control'} for b in m['content']]
-    assert plain(two['messages'][0]) == plain(one['messages'][0])
+    # Request 1's entry ends on Hermes' frame (the reminder sits behind it); request 2 replays that prefix.
+    mark = message_marks(one)[-1]
+    assert mark == (0, 0) and prefix(two, mark) == prefix(one, mark)
