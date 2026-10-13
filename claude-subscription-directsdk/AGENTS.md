@@ -74,6 +74,16 @@ commit) before debugging the table.
 HERMES_AGENT_REPO=~/.hermes/hermes-agent python -m pytest -q
 ```
 
+The same tests in 4 independent processes, split by file (about 2.5x faster; most time is waiting on fake CLIs):
+
+```
+HERMES_AGENT_REPO=~/.hermes/hermes-agent python tests/run_suite.py
+```
+
+Tests never read the caller's profile or warm switch: `conftest.py` gives each test an empty `HERMES_HOME`
+and clears `CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM`. A test waits on the condition it checks (an event, a
+socket, a process), never on a fixed sleep longer than the behaviour needs.
+
 CI runs the suite on ubuntu, macOS and Windows. Gate a merge on
 `gh pr checks <n> --repo NousResearch/hermes-official-plugins` exiting 0
 (8 = still pending), never on a `statusCheckRollup` grep: lanes that have not started have no
