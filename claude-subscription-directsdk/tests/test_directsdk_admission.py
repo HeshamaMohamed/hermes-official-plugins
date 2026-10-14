@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -332,17 +333,35 @@ def test_upstream_closed_sees_a_real_reset():
             assert upstream_closed(rfile) is True
 
 
+class _SilentSocketWatch:
+    """An open, silent socket under upstream_closed, started when this module is imported.
+
+    The silent window must outlast any timer a future upstream_closed might add (at least WINDOW seconds).
+    Starting it at import lets the tests that run first fill that window, so the test waits only for what is left."""
+    WINDOW = 0.5
+
+    def __init__(self):
+        import socket
+        self.left, self.right = socket.socketpair()
+        self.rfile = self.right.makefile('rb')
+        self.verdict, self.done = [], threading.Event()
+        self.started = time.monotonic()
+        self.watcher = threading.Thread(target=lambda: (self.verdict.append(upstream_closed(self.rfile)), self.done.set()), daemon=True)
+        self.watcher.start()
+
+
+_SILENT = _SilentSocketWatch()
+
+
 def test_upstream_closed_never_passes_a_socket_that_is_still_open():
-    import socket
-    left, right = socket.socketpair()
-    with left, right, right.makefile('rb') as rfile:
-        verdict, done = [], threading.Event()
-        watcher = threading.Thread(target=lambda: (verdict.append(upstream_closed(rfile)), done.set()), daemon=True)
-        watcher.start()
-        assert not done.wait(0.5)  # Open and silent: never reported closed.
-        left.sendall(b'x')
-        assert done.wait(5) and verdict == [False]  # Open and talking: not closed either.
-        watcher.join(5)
+    watch = _SILENT
+    with watch.left, watch.right, watch.rfile:
+        # Open and silent for at least WINDOW since import: never reported closed.
+        assert not watch.done.wait(max(0, watch.WINDOW - (time.monotonic() - watch.started)))
+        assert time.monotonic() - watch.started >= watch.WINDOW
+        watch.left.sendall(b'x')
+        assert watch.done.wait(5) and watch.verdict == [False]  # Open and talking: not closed either.
+        watch.watcher.join(5)
 
 
 def test_incomplete_upstream_error_names_the_first_attempt(tmp_path):
@@ -406,7 +425,7 @@ def test_silent_upstream_fails_fast_instead_of_hanging(tmp_path, monkeypatch):
     within the idle bound, not wait out the request timeout while Hermes sees nothing."""
     import time
     import admission
-    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', 1)
+    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', .2)
     release = threading.Event()
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -433,7 +452,7 @@ def test_pings_keep_a_slow_upstream_alive(tmp_path, monkeypatch):
     """Long thinking streams only pings for a while; bytes inside the idle bound must never fail it."""
     import time
     import admission
-    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', 1)
+    monkeypatch.setattr(admission, 'UPSTREAM_IDLE_SECONDS', .2)
     usage = {'input_tokens':0, 'output_tokens':0}
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -442,8 +461,8 @@ def test_pings_keep_a_slow_upstream_alive(tmp_path, monkeypatch):
             self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
             send = lambda e: (self.wfile.write(('data: '+json.dumps(e)+'\n\n').encode()), self.wfile.flush())
             send({'type':'message_start','message':{'id':'first','role':'assistant','model':'sonnet','content':[],'usage':usage}})
-            for _ in range(6):  # 3 s of pings, three times the patched idle bound
-                time.sleep(.5); send({'type':'ping'})
+            for _ in range(6):  # 0.6 s of pings, three times the patched idle bound; each gap half of it
+                time.sleep(.1); send({'type':'ping'})
             send({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})
             send({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':'FIRST'}})
             send({'type':'content_block_stop','index':0})

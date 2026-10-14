@@ -51,3 +51,54 @@ def profile(tmp_path, monkeypatch):
     result = providers.get_provider_profile(PLUGIN_NAME)
     assert result is not None, "installed-plugin discovery (step 2b) did not register the provider"
     return result
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path_factory, monkeypatch):
+    """Plugin settings (warm_session, telemetry) are read from $HERMES_HOME/config.yaml on every call.
+
+    Without this the suite inherits the caller's profile: a profile with ``warm_session: true`` sends the
+    one-shot fakes down the warm path, where each waits out its full timeout. A test that needs its own home
+    sets it with monkeypatch after this runs (``profile`` does)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("isolated-hermes-home")))
+    # The same for the environment switch: a caller exporting CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM=1 would send the
+    # per-call fakes down the warm path. Warm tests set it on their own clients.
+    monkeypatch.delenv("CLAUDE_SUBSCRIPTION_DIRECTSDK_WARM", raising=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _fast_server_stop():
+    """Cap every ``serve_forever()`` poll at 10 ms in the test process.
+
+    The fake upstreams used the default 0.5 s poll and admission's relay uses 0.05 s, so every ``shutdown()``
+    waited up to that long for the loop to notice. On these servers (plain HTTPServer / ThreadingHTTPServer,
+    no ``service_actions`` override) the poll paces only that stop check: requests are served on socket
+    readiness, so no request path changes."""
+    import socketserver
+
+    original = socketserver.BaseServer.serve_forever
+
+    def serve_forever(self, poll_interval=0.5):
+        return original(self, min(poll_interval, 0.01))
+
+    socketserver.BaseServer.serve_forever = serve_forever
+    yield
+    socketserver.BaseServer.serve_forever = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_server_name_lookup():
+    """HTTPServer.server_bind sets ``server_name`` with a reverse DNS lookup (``socket.getfqdn``), about 1 ms on
+    each of the ~340 servers the suite starts. Nothing here reads ``server_name``; bind and listen are unchanged."""
+    import http.server
+    import socketserver
+
+    original = http.server.HTTPServer.server_bind
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+    http.server.HTTPServer.server_bind = server_bind
+    yield
+    http.server.HTTPServer.server_bind = original
