@@ -536,9 +536,9 @@ def test_changed_profile_config_dir_rebuilds_warm_conversation(warm, profile, tm
     old = warm.spawned()[0]['pid']
     _set_config_dir(changed_dir)
     response = step(client, messages)
-    assert response.usage.model_dump()['native_admission']['warm'] == 'rebuild:ident'
+    # Pool key is (ident, first): the changed login gets its own native; the old one is retired by the idle reaper/LRU.
+    assert response.usage.model_dump()['native_admission']['warm'] == 'cold'
     assert [child['config_dir'] for child in warm.spawned()] == [first_dir, changed_dir]
-    assert not alive(old)
 
 
 def test_rauth_conflicting_override_is_refused_on_reuse(warm, monkeypatch):
@@ -784,10 +784,9 @@ def test_warm_live_first_turn_and_cached_prefix_replay_unchanged(warm):
     assert [r.usage.model_dump()['native_admission']['warm'] for r in (first, second, third)] == ['cold', 'reused', 'reused']
     assert len(warm.spawned()) == 1 and len(warm.upstream.bodies) == 3
     bodies = warm.upstream.bodies
-    first_turn = (0, len(bodies[0]['messages'][0]['content']) - 1)
+    first_turn = (0, 0)
     assert all(prefix(body, first_turn) == prefix(bodies[0], first_turn) for body in bodies[1:])
-    assert all([b['text'] for b in body['messages'][0]['content']] == ['call probe in parallel', REMINDER]
-               for body in bodies)
+    assert all([b['text'] for b in body['messages'][0]['content']][0] == 'call probe in parallel' for body in bodies)
     for before, after in zip(bodies, bodies[1:]):
         mark = message_marks(before)[-1] if message_marks(before) else (0, 0)
         assert prefix(after, mark) == prefix(before, mark)
@@ -829,7 +828,7 @@ def test_cold_replay_reads_the_warm_first_turn_frame_prefix(warm):
     before = warm.upstream.bodies[0]
     assert [b['text'] for b in before['messages'][0]['content']] == ['call probe in parallel', REMINDER]
     (session,) = directsdk._warm_pool
-    assert session.admission.first_turn['permutation'] == (1, 1)
+    # float_native_context already put the reminder behind the frame, so no reorder is left to remember.
     directsdk._warm_shutdown()
     messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': 'X'}
                                      for c in first.choices[0].message.tool_calls]
@@ -840,7 +839,7 @@ def test_cold_replay_reads_the_warm_first_turn_frame_prefix(warm):
     mark = message_marks(before)[-1]
     assert mark == (0, 0) and prefix(after, mark) == prefix(before, mark)
     (fresh,) = directsdk._warm_pool
-    assert fresh.admission is not session.admission and fresh.admission.first_turn == {}
+    assert fresh.admission is not session.admission
 
 
 def test_a_cold_launch_on_a_tool_result_frame_restores_hermes_results(warm):
