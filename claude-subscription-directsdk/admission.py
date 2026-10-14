@@ -246,7 +246,7 @@ def float_native_context(payload, queried, recorded):
         return payload, recorded
 
 
-def pin_message_breakpoint(payload, queried, reorder_first=True):
+def pin_message_breakpoint(payload, queried):
     """Keep the recurring message ``cache_control`` on content the next request replays unchanged.
 
     Native attaches per-request context (today's date, the account-email reminder, whatever a
@@ -276,9 +276,8 @@ def pin_message_breakpoint(payload, queried, reorder_first=True):
     try:
         body = json.loads(payload)
         messages = body['messages']
-        # A warm native replays its first turn exactly as it first built it (reminder first), so moving the
-        # reminder on request 1 would break the prefix request 2 replays (PR #29 review): warm skips it.
-        reordered = _frame_first(messages, queried) if reorder_first else False
+        # On a warm native float_native_context already moved the launch reminder behind the frame, so this is a no-op there.
+        reordered = _frame_first(messages, queried)
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
@@ -294,10 +293,6 @@ def pin_message_breakpoint(payload, queried, reorder_first=True):
                     break
                 prefix.append((last + 1, j, sent))
             rest = newest['content'][len(prefix):]
-            if not reorder_first and last < 0:
-                # Warm first turn: the live native replays this whole message unchanged, so it is all stable.
-                prefix = [(last + 1, j, b) for j, b in enumerate(newest['content'])]
-                rest = []
             if not (rest and isinstance(rest[0], dict) and rest[0].get('type') == 'tool_result'):
                 stable += prefix
         target = next(((i, j, b) for i, j, b in reversed(stable)
@@ -556,7 +551,6 @@ class _Server(HTTPServer):
 class Admission:
     # A warm session sets this True: its live native keeps its launch context where it first put it (float_native_context).
     float_context = False
-    reorder_first = True
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
         self.queried = queried
@@ -667,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 # After restoration, which anchors on native's own layout; before pinning, which then keeps the
                 # breakpoint ahead of the moved context.
                 payload, gate.context = float_native_context(payload, gate.queried, gate.context)
-            payload = pin_message_breakpoint(payload, gate.queried, gate.reorder_first)
+            payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
                 if gate.proxy:
