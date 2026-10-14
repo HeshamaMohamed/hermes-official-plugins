@@ -216,6 +216,10 @@ Token usage retains native uncached/cache-read/cache-write/output components. Co
 ```sh
 # HERMES_AGENT_REPO defaults to ~/.hermes/hermes-agent (a hermes-agent checkout supplies `providers`/`agent`)
 ~/.hermes/hermes-agent/.venv/bin/python3 -m pytest tests/
+# Profile run (from ~/.hermes/profiles/<profile>/): --confcutdir=. keeps the profile conftest.py in scope.
+# It puts Hermes' runtime deps (ruamel) on sys.path; without it the plugin's pyproject.toml becomes the
+# rootdir, the profile conftest is skipped, and 52 errors + 10 failures appear.
+python3 -m pytest plugins/claude-subscription-directsdk-experimental/tests -q -p no:cacheprovider --confcutdir=.
 python evals/directsdk_admission.py /path/to/claude
 python evals/directsdk_cache_wire.py /path/to/claude
 ```

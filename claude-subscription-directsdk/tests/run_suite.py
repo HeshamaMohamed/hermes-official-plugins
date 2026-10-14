@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+STARTUP = 120.0  # most a worker may take to start its first test (interpreter start and collection are not a test)
 NO_TESTS = 5  # pytest.ExitCode.NO_TESTS_COLLECTED
 TEST_ID = re.compile(r'^(\S+\.py::\S+)')
 
@@ -39,7 +40,7 @@ def groups(files, n):
 class Worker:
     def __init__(self, group, command, cwd, env):
         self.group, self.lines, self.test, self.hung = group, [], None, False
-        self.started = time.monotonic()
+        self.began, self.started, self.dumped = time.monotonic(), None, False
         self.proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -48,6 +49,8 @@ class Worker:
     def _read(self):
         for line in self.proc.stdout:
             self.lines.append(line.rstrip('\n'))
+            if self.test and not self.dumped and re.match(r'\s+File .*, line \d+ in ' + re.escape(self.test.split('::')[-1]) + r'\s*$', line):
+                self.dumped = True  # faulthandler has printed the running test's own frame
             match = TEST_ID.match(line)
             if match:  # "-v" prints the id when a test starts, and again with its result
                 self.test, self.started = match.group(1), time.monotonic()
@@ -77,7 +80,10 @@ def main(argv):
         # Kill a stuck worker half a second after faulthandler has printed its test's stack.
         while any(w.proc.poll() is None for w in workers):
             for w in workers:
-                if w.proc.poll() is None and time.monotonic() - w.started > limit + 0.5:
+                now = time.monotonic()
+                # Past the limit, wait for faulthandler's dump of the test's frame (the real condition), not a fixed time.
+                late = (w.dumped or now - w.started > limit + 15) if w.started else now - w.began > STARTUP
+                if w.proc.poll() is None and late:
                     w.hung = True
                     w.proc.kill()
             time.sleep(0.05)
