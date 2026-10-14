@@ -16,6 +16,11 @@ import pytest
 HERMES_AGENT_REPO = Path(os.environ.get("HERMES_AGENT_REPO") or Path.home() / ".hermes" / "hermes-agent").expanduser()
 REPO_ROOT = Path(__file__).resolve().parent
 PLUGIN_NAME = "claude-subscription-directsdk-experimental"
+# Importing core's agent.conversation_loop imports hermes_bootstrap, which on a self-updating install calls
+# hermes_cli.venv_sync.prepare_launch and os.execv's this process into the store Python (hermes_bootstrap.py
+# `os.execv(str(_launch_python), _command)`). That interpreter has no pytest, so the run dies with no report.
+# prepare_launch skips the relaunch when this is set (hermes_cli/venv_sync.py); core's own tests set it too.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 for path in (str(HERMES_AGENT_REPO), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
