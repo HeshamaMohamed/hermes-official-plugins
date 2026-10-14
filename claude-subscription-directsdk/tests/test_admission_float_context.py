@@ -98,6 +98,51 @@ def test_the_launch_reminder_is_recorded_once_and_moved_after_the_newest_frame_o
     assert prefix(later, (0, 0)) == prefix(first, (0, 0))
 
 
+def test_a_reminder_native_folded_into_its_launch_tool_result_moves_after_the_newest_frame():
+    # A native launched on a tool-result frame replays that frame with the reminder inside the tool_result's content,
+    # and one '\n' added to the text before it (native 2.1.296, measured on the wire). A fresh native replaying the
+    # same history sends the tool_result as Hermes gave it, the reminder after the newest frame.
+    text = 'Public tool result 1\n'
+    launch = {'type': 'tool_result', 'tool_use_id': 't1', 'content': [{'type': 'text', 'text': text}]}
+    _, recorded = relay(wire([{'role': 'user', 'content': [ASK]}, tool_use(1), {'role': 'user', 'content': [REMINDER, launch]}]),
+                        [launch], None)
+    assert recorded == [REMINDER]
+    folded = dict(launch, content=[{'type': 'text', 'text': text + '\n'}, REMINDER])
+    live = [{'role': 'user', 'content': [ASK]}, tool_use(1), {'role': 'user', 'content': [folded]},
+            tool_use(2), {'role': 'user', 'content': [dict(result(2), cache_control=MARK)]}]
+    fresh = [{'role': 'user', 'content': [ASK]}, tool_use(1), {'role': 'user', 'content': [launch]},
+             tool_use(2), {'role': 'user', 'content': [dict(result(2), cache_control=MARK), REMINDER]}]
+    a, _ = relay(wire(live), [result(2)], recorded)
+    b, _ = relay(wire(fresh), [result(2)], recorded)
+    assert a == b
+    assert a['messages'][2]['content'] == [launch]
+    assert a['messages'][-1]['content'] == [dict(result(2), cache_control=MARK), REMINDER]
+
+
+def test_a_native_launched_on_a_tool_result_frame_records_the_reminder_it_folded_in():
+    # On its first request such a native puts the reminder inside the queried tool_result, after Hermes' text. The relay
+    # restores that frame (dropping the reminder) before float_native_context runs, so it must be read first.
+    from admission import folded_context, restore_queried_turn
+    launch = {'type': 'tool_result', 'tool_use_id': 't1', 'content': [{'type': 'text', 'text': 'Public tool result 1\n'}]}
+    sent = dict(launch, content=launch['content'] + [REMINDER])
+    payload = wire([{'role': 'user', 'content': [ASK]}, tool_use(1), {'role': 'user', 'content': [sent]}])
+    folded = folded_context(payload, [launch])
+    assert folded == [REMINDER]
+    _, recorded = float_native_context(restore_queried_turn(payload, [launch]), [launch], None)
+    assert recorded == []  # what the relay recorded before this fix: nothing, so later folds never moved
+    # A frame native left as Hermes sent it records nothing.
+    assert folded_context(wire([{'role': 'user', 'content': [launch]}]), [launch]) == []
+
+
+def test_a_folded_reminder_without_the_added_newline_is_left_alone():
+    # Only native's exact fold is undone: no '\n' to take back means the text is not native's join, so nothing moves.
+    other = {'type': 'tool_result', 'tool_use_id': 't1', 'content': [{'type': 'text', 'text': 'Public tool result 1'}, REMINDER]}
+    live = [{'role': 'user', 'content': [ASK]}, tool_use(1), {'role': 'user', 'content': [other]},
+            tool_use(2), {'role': 'user', 'content': [result(2)]}]
+    body, _ = relay(wire(live), [result(2)], [REMINDER])
+    assert body['messages'][2]['content'] == [other]
+
+
 def test_nothing_is_added_dropped_or_edited():
     live = [{'role': 'user', 'content': [REMINDER, TURN]}, {'role': 'system', 'content': ENV}, tool_use(1),
             {'role': 'user', 'content': [result(1)]}, {'role': 'system', 'content': [{'type': 'text', 'text': DATE}]}]

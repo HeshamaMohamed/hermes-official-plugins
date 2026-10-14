@@ -232,6 +232,18 @@ def float_native_context(payload, queried, recorded):
             if len(spots) == 1 and len(spots[0][0]['content']) > 1:
                 m, j = spots[0]
                 moved.append(m['content'].pop(j))
+            elif not spots:
+                # A native launched on a tool-result frame folds the reminder into that tool_result's content and adds
+                # one '\n' to the text before it: take both back, so the frame is the one a fresh native replays.
+                nested = [(b['content'], k) for m in rest[:-1] if m.get('role') == 'user' and isinstance(m.get('content'), list)
+                          for b in m['content'] if isinstance(b, dict) and b.get('type') == 'tool_result' and isinstance(b.get('content'), list)
+                          for k, x in enumerate(b['content']) if _plain(x) == block]
+                if len(nested) == 1:
+                    content, k = nested[0]
+                    before = content[k - 1] if k > 0 else None
+                    if isinstance(before, dict) and before.get('type') == 'text' and isinstance(before.get('text'), str) and before['text'].endswith('\n'):
+                        before['text'] = before['text'][:-1]
+                        moved.append(content.pop(k))
         if not system and not moved:
             return payload, recorded
         newest.extend(moved)
@@ -244,6 +256,34 @@ def float_native_context(payload, queried, recorded):
         return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), recorded
     except (ValueError, TypeError, KeyError, AttributeError, IndexError):
         return payload, recorded
+
+
+def folded_context(payload, queried):
+    """The bare text blocks native appended inside the queried tool results on its first request (plain form).
+
+    A native launched on a tool-result frame puts its per-process context (the account reminder) inside that frame's
+    tool_result content, after Hermes' text. Restoration drops it from that request, so float_native_context never sees
+    it there; on later requests native replays the frame with it folded in. Read before restoration."""
+    try:
+        body = json.loads(payload)
+        newest = next((m for m in reversed(body['messages']) if m.get('role') == 'user'), {})
+        host = {b['tool_use_id']: b.get('content') for b in queried or []
+                if isinstance(b, dict) and b.get('type') == 'tool_result'}
+        found = []
+        content = newest.get('content')
+        for b in content if isinstance(content, list) else []:
+            if not (isinstance(b, dict) and b.get('type') == 'tool_result' and b.get('tool_use_id') in host):
+                continue
+            sent, want = b.get('content'), host[b['tool_use_id']]
+            n = 1 if isinstance(want, str) else len(want) if isinstance(want, list) else None
+            if not isinstance(sent, list) or n is None or len(sent) <= n:
+                continue
+            extra = sent[n:]
+            if all(isinstance(x, dict) and set(x) == {'type', 'text'} and x['type'] == 'text' for x in extra):
+                found += [dict(x) for x in extra]
+        return found
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return []
 
 
 def pin_message_breakpoint(payload, queried):
@@ -650,6 +690,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
+            # A native's first request: what it folded into the queried tool results, before restoration drops it.
+            folded = folded_context(payload, gate.queried) if gate.float_context and gate.context is None else []
             try:
                 payload = restore_queried_turn(payload, gate.queried)
             except QueriedTurnMismatch as exc:
@@ -661,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                 # After restoration, which anchors on native's own layout; before pinning, which then keeps the
                 # breakpoint ahead of the moved context.
                 payload, gate.context = float_native_context(payload, gate.queried, gate.context)
+                if folded:
+                    gate.context = (gate.context or []) + [b for b in folded if b not in (gate.context or [])]
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
