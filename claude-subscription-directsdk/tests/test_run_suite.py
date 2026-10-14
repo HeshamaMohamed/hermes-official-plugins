@@ -3,6 +3,7 @@
 Each case runs run_suite.py as its own process over a temp tests directory, so the real suite is not involved.
 """
 import subprocess
+import time
 import sys
 import textwrap
 from pathlib import Path
@@ -40,10 +41,42 @@ def test_a_hung_test_prints_its_stack_and_fails_naming_it(tmp_path):
         import time
         def test_stuck():
             time.sleep(60)
-    '''}, '-t', '0.2')
+    '''}, '-t', '0.2', '-p', 'no:xonsh')
     assert code != 0, out
     assert 'Timeout' in out and 'in test_stuck' in out, out  # faulthandler's stack dump
     assert 'hung over 0.2s in tests/test_hang.py::test_stuck' in out, out
+
+
+def test_a_slow_start_is_not_a_hang_and_the_hung_test_still_prints_its_stack(tmp_path):
+    # Startup (here a 1.2 s import) is longer than limit+0.5 s: the kill window must open at the test, not at spawn.
+    began = time.monotonic()
+    code, out = run(tmp_path, {'test_hang.py': '''
+        import time
+        time.sleep(1.2)
+        def test_stuck():
+            time.sleep(60)
+    '''}, '-t', '0.2', '-p', 'no:xonsh')
+    assert code != 0, out
+    assert time.monotonic() - began < 10, 'killed on the fallback timer, not on the dump'
+    assert 'Timeout' in out and 'in test_stuck' in out, out
+    assert 'hung over 0.2s in tests/test_hang.py::test_stuck' in out, out
+
+
+def test_the_kill_waits_for_a_late_stack_dump(tmp_path):
+    # A conftest delays faulthandler's dump to limit+0.4 s (a loaded machine does this): the worker must live until it prints.
+    code, out = run(tmp_path, {'conftest.py': '''
+        import faulthandler
+        _later = faulthandler.dump_traceback_later
+        faulthandler.dump_traceback_later = lambda t, *a, **k: _later(t + 0.4, *a, **k)
+    ''', 'test_ok.py': OK, 'test_hang.py': '''
+        import time
+        def test_before():
+            pass
+        def test_stuck():
+            time.sleep(60)
+    '''}, '-t', '0.2', '-p', 'no:xonsh')
+    assert code != 0, out
+    assert 'Timeout' in out and 'in test_stuck' in out, out
 
 
 def test_a_worker_with_nothing_selected_does_not_fail_the_run(tmp_path):
