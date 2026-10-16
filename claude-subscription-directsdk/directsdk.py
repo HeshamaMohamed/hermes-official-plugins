@@ -64,6 +64,14 @@ def _dropped(admission, text):
     return text + (f' [{CONNECTION_RESET_TEXT}]' if admission.failure in CONNECTION_FAILURES else '')
 
 
+# Identity a Claude Code or Agent SDK host gives its children. A Hermes launched from inside one (Hermes.app opened
+# from the Claude app) inherits them; native then sends that host's side requests first (a session title, a status
+# check) and the admission gate admits the title request as the turn's one call. Hermes is native's only host.
+HOST_MARKERS = ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_HOST_SESSION_ID',
+                'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_DESKTOP_APP_VERSION', 'CLAUDE_PID')
+HOST_MARKER_PREFIX = 'CLAUDE_AGENT_SDK_'
+
+
 # Native's own error codes for errors it answers without a relayed upstream status.
 NATIVE_ERROR_STATUS = {
     'rate_limit': 429,  # plan/session limit ("You've hit your session limit")
@@ -665,6 +673,8 @@ class Client:
         # An inherited effort level would override the --effort Hermes passes below.
         for key in ('CLAUDE_CODE_EXTRA_BODY', 'CLAUDE_CODE_EFFORT_LEVEL'):
             env.pop(key, None)
+        for key in [k for k in env if k in HOST_MARKERS or k.startswith(HOST_MARKER_PREFIX)]:
+            del env[key]
         env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
         # Telemetry and feature flags follow the user's claude_code_telemetry setting, read per spawn.
         apply_traffic_policy(env)
