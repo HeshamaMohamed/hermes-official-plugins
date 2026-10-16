@@ -8,7 +8,7 @@ prefix="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/claude-code.XXXXXX")"
 npm install --prefix "$prefix" --no-audit --no-fund --loglevel=error "@anthropic-ai/claude-code@$version"
 claude="$prefix/node_modules/.bin/claude"
 "$claude" --version
-for eval in evals/directsdk_admission.py evals/directsdk_cache_wire.py; do
+for eval in evals/directsdk_admission.py evals/directsdk_cache_wire.py evals/directsdk_composed_text.py; do
   echo "::group::$eval"
   python "$eval" "$claude"
   echo "::endgroup::"

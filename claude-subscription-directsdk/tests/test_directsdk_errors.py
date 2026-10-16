@@ -76,3 +76,31 @@ def test_watchdog_kill_classifies_like_a_timeout(profile):
     for other in (RuntimeError('Native request failed: error_during_execution'), InterruptedError('Agent interrupted during API call'),
                   TimeoutError('Claude request timed out'), ValueError('model is required')):
         assert profile.classify_api_error(other) is None
+
+
+TOOLS = [{'type': 'function', 'function': {'name': 'probe', 'description': 'long ' * 600 + 'TAIL', 'parameters': {'type': 'object', 'properties': {'value': {'type': 'string'}}}}}]
+
+
+def test_a_command_shaped_turn_reaches_the_model(tmp_path):
+    """Hermes composes every turn, so native delivers "/status please" as written. Unmarked, native 2.1.301 answered it
+    itself ("/status isn't available in this environment.") with no upstream request and the step failed."""
+    client = _native(tmp_path, '')
+    try:
+        result = client.create(model='sonnet', messages=[{'role': 'user', 'content': '/status please'}], tools=TOOLS)
+    finally:
+        client.close()
+    assert result.choices[0].message.tool_calls[0].function.name == 'probe'
+
+
+def test_a_turn_native_answers_itself_fails_loud(tmp_path):
+    """A CLI that still dispatches the text as its own command: its reply is never shown as the model's (ADR-0012)."""
+    client = _native(tmp_path, '')
+    client.env['FAKE_IGNORE_COMPOSED'] = '1'
+    try:
+        with pytest.raises(directsdk.NativeAnsweredLocally) as raised:
+            client.create(model='sonnet', messages=[{'role': 'user', 'content': '/status please'}], tools=TOOLS)
+    finally:
+        client.close()
+    assert str(raised.value).startswith("HERMES_NATIVE_ANSWERED_LOCALLY: native answered this turn itself and sent no request to "
+                                        "the model (native said: \"/status isn't available in this environment.\")")
+    assert raised.value.status_code is None

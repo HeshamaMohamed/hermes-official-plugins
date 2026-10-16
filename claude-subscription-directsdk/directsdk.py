@@ -54,6 +54,26 @@ class ClaudeAPIError(RuntimeError):
         self.status_code = status_code
 
 
+class NativeAnsweredLocally(ClaudeAPIError):
+    """Native answered the turn itself and sent nothing upstream; a fresh native answers the same way, so no retry."""
+
+
+def _local_reply(event):
+    """The text of native's own reply to a turn (an assistant row from model "<synthetic>" with no error), else None."""
+    message = event.get('message') or {}
+    if event.get('type') != 'assistant' or message.get('model') != '<synthetic>' or event.get('error') or message.get('error'):
+        return None
+    return '\n'.join(b.get('text', '') for b in message.get('content') or [] if b.get('type') == 'text')
+
+
+def _answered_locally(reply):
+    # Every Hermes turn is client_composed; a CLI that still dispatches its text as a command is not supported (ADR-0012).
+    return NativeAnsweredLocally(f'HERMES_NATIVE_ANSWERED_LOCALLY: native answered this turn itself and sent no request to the model '
+                                 f'(native said: {json.dumps(reply[:300], ensure_ascii=False)}). This Claude Code read the turn\'s '
+                                 'text as one of its own commands instead of delivering it as written (client_composed); '
+                                 'update it with `claude update`.')
+
+
 # Relay failures that are a dropped or reset connection; core's error classifier only reads the text.
 CONNECTION_FAILURES = {'ConnectionResetError', 'ConnectionAbortedError', 'BrokenPipeError', 'RemoteDisconnected', 'IncompleteRead'}
 CONNECTION_RESET_TEXT = 'connection reset by peer'
@@ -198,7 +218,13 @@ def prepare_history(messages, names=None):
         if frames and frames[-1]['type'] == role and role == 'user':
             frames[-1]['message']['content'].extend(blocks)
         else:
-            frames.append({'type': role, 'message': {'role': role, 'content': blocks}})
+            frame = {'type': role, 'message': {'role': role, 'content': blocks}}
+            if role == 'user':
+                # Hermes composed this turn, so native delivers its text as written: no slash-command dispatch, no
+                # @path expansion. Without it a "/status ..." turn got native's own "isn't available" reply and no
+                # upstream request, and a replayed one reached the model as native's command transcript.
+                frame['client_composed'] = True
+            frames.append(frame)
     if not frames or frames[-1]['type'] != 'user' or not frames[-1]['message']['content']:
         raise ValueError('History must end in a nonempty user/tool-result message; assistant prefill is unsupported')
     return '\n\n'.join(system), frames
@@ -787,7 +813,7 @@ class Client:
                                 break
                 p.stdin.close()
                 assistants, results, stopped, emitted = [], [], False, ''
-                native_error = native_error_code = None
+                native_error = native_error_code = local = None
                 while True:
                     event = receive()
                     if event is None:
@@ -799,6 +825,7 @@ class Client:
                             native_error, native_error_code = detail, event.get('error')
                         else:
                             assistants.append(event['message'])
+                            local = _local_reply(event) if local is None else local
                     elif kind == 'result':
                         results.append(event)
                     elif kind == 'stream_event':
@@ -838,6 +865,8 @@ class Client:
                         # No usable login where Hermes runs native: it refuses before any upstream request; only its /api/hello pre-flight reaches the relay.
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error}){_stderr_tail(native_stderr)}')
                     raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)))
+                if local is not None and not admission.used:
+                    raise _answered_locally(local)
                 if len(results) != 1 or not assistants or not stopped:
                     raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
                 final = results[0]
@@ -955,7 +984,7 @@ class Client:
                     session.deliver(results)
             else:
                 self._warm_spawn(session, request, kwargs, body, manifest, system, frames, timeout, env, resolved)
-            emitted, native_error, native_error_code, final = '', None, None, None
+            emitted, native_error, native_error_code, final, local = '', None, None, None, None
             while True:
                 event = session.receive(request, timeout)
                 if event is None:
@@ -964,6 +993,8 @@ class Client:
                 if kind == 'assistant' and (event.get('error') or event.get('message', {}).get('error')):
                     native_error = '\n'.join(b.get('text', '') for b in event.get('message', {}).get('content', []) if b.get('type') == 'text')
                     native_error_code = event.get('error')
+                elif kind == 'assistant' and local is None:
+                    local = _local_reply(event)
                 elif kind == 'result':
                     final = event
                     break
@@ -996,6 +1027,8 @@ class Client:
             # Failures carry the status Hermes routes retry/fallback on, as in baseline (#58).
             if native_error and not admission.used:
                 raise ClaudeAPIError('Native API error: ' + native_error, NATIVE_ERROR_STATUS.get(str(native_error_code)))
+            if local is not None and not admission.used:
+                raise _answered_locally(local)
             if not admission.used or admission.status != 200 or not admission.capture.complete:
                 first_attempt = f'upstream used: {admission.used}, status {admission.status}, capture ' + ('complete' if admission.capture.complete else 'incomplete') + (f', relay failure {admission.failure}' if admission.failure else '') + f', native retries denied: {admission.denied}'
                 if admission.error_text():
@@ -1078,7 +1111,7 @@ class Client:
             admission = session.admission
             if admission is not None:
                 admission.abort()  # nothing is admitted after this, so `used` is final
-            refused = isinstance(error, (ValueError, ClaudeCodeMissing, ClaudeCodeLoggedOut)) or (isinstance(error, ClaudeAPIError) and error.status_code is not None)
+            refused = isinstance(error, (ValueError, ClaudeCodeMissing, ClaudeCodeLoggedOut, NativeAnsweredLocally)) or (isinstance(error, ClaudeAPIError) and error.status_code is not None)
             # A refused side request recurs on a fresh native under the same environment: no per-call retry.
             if yielded or refused or request.cancelled.is_set() or (admission is not None and (admission.used or admission.refused)):
                 raise

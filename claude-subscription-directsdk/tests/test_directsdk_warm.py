@@ -171,6 +171,11 @@ for line in sys.stdin:
             # A plan limit native answers itself, with no upstream request.
             out({'type':'assistant','error':os.environ['NATIVE_ERROR'],'message':{'role':'assistant','model':'<synthetic>','content':[{'type':'text','text':'limit reached'}]}})
             out({'type':'result','subtype':'success','is_error':True,'num_turns':1})
+        elif row['type'] == 'user' and (os.environ.get('FAKE_IGNORE_COMPOSED') or not row.get('client_composed')) and any(b.get('type') == 'text' and b['text'].startswith('/status') for b in row['message']['content']):
+            # 2.1.301 dispatches a built-in command name in a turn not marked client_composed: its own reply, no upstream request.
+            text = "/status isn't available in this environment."
+            out({'type':'assistant','message':{'role':'assistant','model':'<synthetic>','content':[{'type':'text','text':text}],'stop_reason':'end_turn'}})
+            out({'type':'result','subtype':'success','is_error':False,'num_turns':0,'result':text})
         elif row['type'] == 'user':
             query()
 '''
@@ -702,6 +707,37 @@ def test_failures_carry_the_status_hermes_routes_on(warm):
     with pytest.raises(directsdk.ClaudeAPIError, match='limit reached') as native:
         step(client, [{'role': 'user', 'content': 'hi'}])
     assert native.value.status_code == 429
+    assert not directsdk._warm_pool
+
+
+@pytest.mark.parametrize('when', ['cold', 'reused'])
+def test_a_command_shaped_turn_reaches_the_model_warm(warm, when):
+    """A warm step delivers "/status please" as written, on a fresh native and on the parked one."""
+    client = warm.client()
+    messages = [{'role': 'user', 'content': '/status please'}]
+    if when == 'reused':
+        opening = [{'role': 'user', 'content': 'hello'}]
+        messages = opening + [as_history(step(client, opening))] + messages
+    result = step(client, messages)
+    assert result.choices[0].message.content == 'echo /status please'
+    assert result.usage.model_dump()['native_admission']['warm'] == when
+
+
+@pytest.mark.parametrize('when', ['cold', 'reused'])
+def test_a_turn_native_answers_itself_fails_loud_warm(warm, when):
+    """A CLI that still dispatches the text as its own command fails the warm step, which is not retried per-call
+    (a fresh native answers the same way)."""
+    client = warm.client()
+    client.env['FAKE_IGNORE_COMPOSED'] = '1'
+    messages = [{'role': 'user', 'content': '/status please'}]
+    if when == 'reused':
+        opening = [{'role': 'user', 'content': 'hello'}]
+        messages = opening + [as_history(step(client, opening))] + messages
+    before = len(warm.upstream.bodies)
+    with pytest.raises(directsdk.NativeAnsweredLocally, match="HERMES_NATIVE_ANSWERED_LOCALLY: .*/status isn't available in this environment"):
+        step(client, messages)
+    assert len(warm.upstream.bodies) == before
+    assert len(warm.spawned()) == 1
     assert not directsdk._warm_pool
 
 

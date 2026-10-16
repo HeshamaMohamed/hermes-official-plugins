@@ -28,6 +28,12 @@ if os.environ.get('NATIVE_ERROR'):
  print(json.dumps({'type':'assistant','error':code,'is_api_error_message':True,'message':{'role':'assistant','model':'<synthetic>','content':[{'type':'text','text':text}],'stop_reason':'stop_sequence'}}),flush=True)
  print(json.dumps({'type':'result','subtype':'success','is_error':True,'num_turns':1,'result':text}),flush=True)
  sys.exit(1)
+if (os.environ.get('FAKE_IGNORE_COMPOSED') or not rows[-1].get('client_composed')) and any(b.get('type')=='text' and b['text'].startswith('/status') for b in rows[-1]['message']['content']):
+ # 2.1.301 dispatches a built-in command name in a turn not marked client_composed: its own reply, no upstream request.
+ text="/status isn't available in this environment."
+ print(json.dumps({'type':'assistant','message':{'role':'assistant','model':'<synthetic>','content':[{'type':'text','text':text}],'stop_reason':'end_turn'}}),flush=True)
+ print(json.dumps({'type':'result','subtype':'success','is_error':False,'num_turns':0,'result':text}),flush=True)
+ sys.exit(0)
 if os.environ.get('HANG'):
  if os.environ.get('PID_FILE'):
   # Real native is a shim -> node tree; cancellation must take the grandchild down with it.
