@@ -54,6 +54,16 @@ class ClaudeAPIError(RuntimeError):
         self.status_code = status_code
 
 
+# Relay failures that are a dropped or reset connection; core's error classifier only reads the text.
+CONNECTION_FAILURES = {'ConnectionResetError', 'ConnectionAbortedError', 'BrokenPipeError', 'RemoteDisconnected', 'IncompleteRead'}
+CONNECTION_RESET_TEXT = 'connection reset by peer'
+
+
+def _dropped(admission, text):
+    """Add the words core's classifier maps to a retryable timeout (so its resume ladder runs) when the relay lost its connection."""
+    return text + (f' [{CONNECTION_RESET_TEXT}]' if admission.failure in CONNECTION_FAILURES else '')
+
+
 # Native's own error codes for errors it answers without a relayed upstream status.
 NATIVE_ERROR_STATUS = {
     'rate_limit': 429,  # plan/session limit ("You've hit your session limit")
@@ -804,7 +814,7 @@ class Client:
                             first += ', upstream said: ' + admission.error_text()[:500]
                         # The first attempt's real HTTP status; a 200 cut short or a relay failure has none.
                         status = admission.status if isinstance(admission.status, int) and admission.status >= 400 else None
-                        raise ClaudeAPIError(f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else ''), status)
+                        raise ClaudeAPIError(_dropped(admission, f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else '')), status)
                     assistants = [admission.capture.message]
                     stopped = True
                 native_failure_handled = admission.denied or (admission.used and assistants[0].get('stop_reason') == 'refusal')
@@ -973,7 +983,7 @@ class Client:
                 if admission.error_text():
                     first_attempt += ', upstream said: ' + admission.error_text()[:500]
                 status = admission.status if isinstance(admission.status, int) and admission.status >= 400 else None
-                raise ClaudeAPIError(f'Incomplete upstream response ({first_attempt})' + (': ' + native_error if native_error else ''), status)
+                raise ClaudeAPIError(_dropped(admission, f'Incomplete upstream response ({first_attempt})' + (': ' + native_error if native_error else '')), status)
             assistant = admission.capture.message
             refused = assistant.get('stop_reason') == 'refusal'
             # A denied native retry, a native error or a refusal leaves native's own state unknown: answer, then rebuild next step.
