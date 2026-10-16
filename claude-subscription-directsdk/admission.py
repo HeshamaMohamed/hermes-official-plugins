@@ -53,6 +53,64 @@ class QueriedTurnMismatch(ValueError):
     """The native request could not be reconciled with Hermes' tool results."""
 
 
+# The gate admits one upstream request per Hermes step: it must be Hermes' turn. Native's side requests (a session
+# title, a status check: real native 2.1.301 under a Claude host's markers) run on native's own system prompt and wrap
+# the conversation in their own instruction, and Hermes' extra body (tools, output_config, response_format included)
+# is merged into them, so neither tools nor output_config.format tell them apart. Only native's main loop sends the
+# system prompt Hermes wrote (--system-prompt-file) and the frame Hermes queried.
+NOT_HERMES_TURN = 'HERMES_MODEL_ADMISSION_NOT_HERMES_TURN'
+# Native's own prompt openings for the side requests seen so far; anything else is named "unrecognized".
+SIDE_REQUESTS = (('You are naming a coding session', 'session-title'),
+                 ('A user kicked off a Claude Code agent', 'status-classifier'))
+
+
+def _system_texts(body):
+    system = body.get('system')
+    if isinstance(system, str):
+        return [system]
+    return [b['text'] for b in system or [] if isinstance(b, dict) and isinstance(b.get('text'), str)]
+
+
+def not_hermes_turn(payload, system, queried):
+    """``(why, kind, head)`` when ``payload`` is not Hermes' turn, None when it is.
+
+    ``kind`` names the side request (SIDE_REQUESTS, else "unrecognized"); ``head`` is its own system prompt, the last
+    system block that is not native's billing header.
+
+    Hermes' turn carries Hermes' system prompt as one system block (when Hermes sent one) and the queried frame in its
+    open turn (the user messages after the last assistant message): every text block verbatim, every tool result by
+    tool_use_id (native may rewrite a result's content, never its id). Media blocks are not compared (native may
+    resize them). A body that is not a JSON object with a messages list is not a turn either."""
+    try:
+        body = json.loads(payload)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or not isinstance(body.get('messages'), list):
+        return 'its body is not a Messages API request', 'unrecognized', ''
+    messages = body['messages']
+    texts = _system_texts(body)
+    head = next((t for t in reversed(texts) if not t.startswith('x-anthropic-billing-header:')), '')
+    kind = next((name for opening, name in SIDE_REQUESTS if head.startswith(opening)), 'unrecognized')
+    if system and system not in texts:
+        return "its system prompt is not Hermes'", kind, head
+    last = max((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get('role') == 'assistant'), default=-1)
+    sent_texts, sent_results = set(), set()
+    for message in messages[last + 1:]:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        for block in [{'type': 'text', 'text': content}] if isinstance(content, str) else content or []:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                sent_texts.add(block.get('text'))
+            elif isinstance(block, dict) and block.get('type') == 'tool_result':
+                sent_results.add(block.get('tool_use_id'))
+    for block in queried or []:
+        if (block.get('type') == 'text' and block.get('text') not in sent_texts
+                or block.get('type') == 'tool_result' and block.get('tool_use_id') not in sent_results):
+            return 'its open turn does not carry the frame Hermes queried', kind, head
+    return None
+
+
 # Winsock: shutdown() does not wake a recv blocked in another thread; closesocket() cancels pending calls.
 # Without it close() waits for a hung upstream (the single-threaded relay is stuck in getresponse()).
 # socket.close() is not enough: http.client holds makefile() refs, so it never reaches closesocket().
@@ -591,9 +649,10 @@ class _Server(HTTPServer):
 class Admission:
     # A warm session sets this True: its live native keeps its launch context where it first put it (float_native_context).
     float_context = False
-    def __init__(self, upstream, timeout, queried=None):
+    def __init__(self, upstream, timeout, queried=None, system=''):
         self.upstream = urlsplit(upstream)
         self.queried = queried
+        self.system = system  # Hermes' system prompt, as written to --system-prompt-file
         host = self.upstream.hostname
         try:
             local = ipaddress.ip_address(host).is_loopback
@@ -608,6 +667,7 @@ class Admission:
         self.cancelled = False
         self.used = False
         self.denied = 0
+        self.refused = None  # not_hermes_turn's message for a side request refused ahead of the turn
         self.request_id = None
         self.status = None
         self.failure = None
@@ -636,7 +696,7 @@ class Admission:
         anchored on that step's queried frame."""
         with self.lock:
             self.timeout, self.used, self.denied, self.queried = timeout, False, 0, queried
-            self.request_id = self.status = self.failure = self.unrestored = None
+            self.request_id = self.status = self.failure = self.unrestored = self.refused = None
             self.capture, self.error_body = Capture(), b''
 
     def abort(self):
@@ -667,29 +727,45 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
 
+    def _deny(self, code):
+        body = json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': code}}).encode()
+        self.send_response(400)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         gate = self.server.admission
         path = urlsplit(self.path)
         if path.path != gate.prefix + '/v1/messages' or self.headers.get('Origin'):
             self.send_error(404)
             return
-        with gate.lock:
-            if gate.cancelled or gate.used:
-                gate.denied += 1
-                body = b'{"type":"error","error":{"type":"invalid_request_error","message":"HERMES_MODEL_ADMISSION_CONSUMED"}}'
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            gate.used = True
-            gate.sockets.add(self.connection)
         conn = None
         upstream_socket = None
         try:
+            with gate.lock:
+                gate.sockets.add(self.connection)
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
+            # Judged before anything reaches upstream: a side request is never forwarded and never becomes the reply.
+            # The step then fails (directsdk raises gate.refused), so the turn behind it is refused too, unbilled.
+            foreign = not_hermes_turn(payload, gate.system, gate.queried)
+            with gate.lock:
+                if gate.cancelled or gate.used or gate.refused:
+                    gate.denied += 1
+                    self._deny(NOT_HERMES_TURN if gate.refused else 'HERMES_MODEL_ADMISSION_CONSUMED')
+                    return
+                if foreign:
+                    why, kind, head = foreign
+                    gate.refused = (f"{NOT_HERMES_TURN}: native sent {'an' if kind[0] in 'aeiou' else 'a'} {kind} side request ahead of the Hermes turn ({why}; "
+                                    f'its system prompt starts {head[:60]!r}). Refused, not forwarded; the turn is not answered. '
+                                    'Native only sends side requests under a Claude host identity: look for Claude host '
+                                    'markers (CLAUDE_CODE_ENTRYPOINT, CLAUDE_AGENT_SDK_*) in the environment Hermes was '
+                                    'launched from, or a Claude Code release that added a side request.')
+                    self._deny(NOT_HERMES_TURN)
+                    return
+                gate.used = True
             # A native's first request: what it folded into the queried tool results, before restoration drops it.
             folded = folded_context(payload, gate.queried) if gate.float_context and gate.context is None else []
             try:

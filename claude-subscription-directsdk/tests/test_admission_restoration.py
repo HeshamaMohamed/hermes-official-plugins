@@ -183,7 +183,6 @@ def test_plain_user_frame_is_byte_identical_after_successful_match():
     ([RESULT], [RESULT, {"type": "text", "text": "note", "unknown": True}]),
     ([RESULT], [{**RESULT, "is_error": True}]),
     ([RESULT], [{**RESULT, "is_error": 0}]),
-    ([RESULT], [{**RESULT, "tool_use_id": "wrong"}]),
     ([RESULT], [{**RESULT, "content": "changed"}]),
     ([RESULT], [RESULT, RESULT]),
     ([RESULT], [{"type": "text", "text": "prepended"}, RESULT]),

@@ -16,10 +16,11 @@ import directsdk
 # A native that speaks the warm protocol: SDK MCP over control requests, one tool call at a time,
 # a new upstream request after every answered batch, and an idle wait for the next user frame.
 NATIVE = r'''
-import json, os, re, sys, urllib.request
+import json, os, re, sys, urllib.error, urllib.request
 with open(os.environ['SPAWNS'], 'a') as f:
     f.write(json.dumps({'pid': os.getpid(), 'argv': sys.argv[1:]}) + '\n')
 history, queue, rpc, answered, limits = [], [], [0], {}, {}
+system = open(sys.argv[sys.argv.index('--system-prompt-file') + 1], encoding='utf-8').read()
 def out(row):
     print(json.dumps(row), flush=True)
 def persist(block, result, force=False):
@@ -93,8 +94,20 @@ def wire():
     if len(messages) > 1:
         messages[-2]['content'][-1]['cache_control'] = {'type':'ephemeral'}
     return messages + [{'role':'system','content':[{'type':'text','text':'Today is 2026-10-05.','cache_control':{'type':'ephemeral'}}]}]
+def side():
+    # FAKE_SIDE names a flag file: while it exists, native sends a session-title request ahead of each turn request.
+    if not (os.environ.get('FAKE_SIDE') and os.path.exists(os.environ['FAKE_SIDE'])):
+        return
+    body = {'system': [{'type':'text','text':'You are naming a coding session so the user can pick it out of a long list.'}],
+            'output_config': {'format': {'type':'json_schema','schema':{'type':'object','properties':{'title':{'type':'string'}}}}},
+            'messages': [{'role':'user','content':[{'type':'text','text':'<session>\nfixture\n</session>'}]}]}
+    try:
+        urllib.request.urlopen(urllib.request.Request(os.environ['ANTHROPIC_BASE_URL'] + '/v1/messages', data=json.dumps(body).encode(), headers={'Content-Type':'application/json'}), timeout=30).read()
+    except urllib.error.HTTPError:
+        pass
 def query():
-    body = json.dumps({'messages': wire()}).encode()
+    side()
+    body = json.dumps({'system': [{'type':'text','text':system}], 'messages': wire()}).encode()
     try:
         raw = urllib.request.urlopen(urllib.request.Request(os.environ['ANTHROPIC_BASE_URL'] + '/v1/messages', data=body, headers={'Content-Type':'application/json'}), timeout=30).read().decode()
     except urllib.error.HTTPError as error:
@@ -555,8 +568,8 @@ def test_rauth_conflicting_override_is_refused_on_reuse(warm, monkeypatch):
     """R-auth: the inherited-environment refusal runs on every warm step, not only at spawn."""
     url = f'http://127.0.0.1:{warm.upstream.server.server_port}'
     class Local(directsdk.Admission):
-        def __init__(self, upstream, timeout, queried=None):
-            super().__init__(url, timeout, queried)
+        def __init__(self, upstream, timeout, **kwargs):
+            super().__init__(url, timeout, **kwargs)
     monkeypatch.setattr(directsdk, 'Admission', Local)
     fixture = warm.client()
     for key, value in fixture.env.items():
@@ -689,6 +702,26 @@ def test_failures_carry_the_status_hermes_routes_on(warm):
     with pytest.raises(directsdk.ClaudeAPIError, match='limit reached') as native:
         step(client, [{'role': 'user', 'content': 'hi'}])
     assert native.value.status_code == 429
+    assert not directsdk._warm_pool
+
+
+@pytest.mark.parametrize('when', ['cold', 'reused'])
+def test_a_side_request_ahead_of_a_warm_step_raises_and_never_falls_back(warm, tmp_path, when):
+    """The step's one admission is Hermes' turn: a native side request before it fails the step (ADR-0012), on a fresh
+    native and on a reused one, and the step is not retried per-call (the same environment sends it again)."""
+    flag = tmp_path / 'side'
+    client = warm.client()
+    client.env['FAKE_SIDE'] = str(flag)
+    messages = [{'role': 'user', 'content': 'call probe in parallel'}]
+    if when == 'reused':
+        first = step(client, messages)
+        messages += [as_history(first)] + [{'role': 'tool', 'tool_call_id': c.id, 'content': 'X'} for c in first.choices[0].message.tool_calls]
+    flag.write_text('on')
+    before = len(warm.upstream.bodies)
+    with pytest.raises(directsdk.ClaudeAPIError, match='HERMES_MODEL_ADMISSION_NOT_HERMES_TURN: native sent a session-title side request'):
+        step(client, messages)
+    assert len(warm.upstream.bodies) == before  # neither the title request nor the turn reached upstream
+    assert len(warm.spawned()) == 1
     assert not directsdk._warm_pool
 
 

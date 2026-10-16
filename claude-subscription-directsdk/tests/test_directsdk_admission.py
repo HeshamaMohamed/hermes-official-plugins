@@ -18,16 +18,21 @@ from directsdk_admission import upstream_closed
 
 NATIVE = r'''
 import json, os, sys, urllib.request, urllib.error
+system=open(sys.argv[sys.argv.index('--system-prompt-file')+1],encoding='utf-8').read()
+frames=[]
 for line in sys.stdin:
     frame=json.loads(line)
+    frames.append(frame['message'])
     if frame.get('shouldQuery') is False:
         print(json.dumps({'type':'result','num_turns':0}),flush=True)
-        continue
-    break
+    elif frame['type']=='user':
+        break
+# The turn as the relay gate checks it: Hermes' system prompt and the replayed frames.
+body=json.dumps({'system':[{'type':'text','text':system}],'messages':frames}).encode()
 url=os.environ['ANTHROPIC_BASE_URL']+'/v1/messages'
 for _ in range(2):
     try:
-        urllib.request.urlopen(urllib.request.Request(url,data=b'{}',headers={'Content-Type':'application/json'}),timeout=5).read()
+        urllib.request.urlopen(urllib.request.Request(url,data=body,headers={'Content-Type':'application/json'}),timeout=5).read()
     except urllib.error.HTTPError:
         break
 print(json.dumps({'type':'assistant','message':{'id':'first','role':'assistant','content':[{'type':'text','text':'FIRST'}]}}))

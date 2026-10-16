@@ -201,7 +201,7 @@ def test_admission_forwards_an_unmatched_tool_result_unchanged():
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     gate = Admission(f'http://127.0.0.1:{peer.server_port}', 5, queried=[RESULT])
-    changed = {**RESULT, 'tool_use_id': 'different'}
+    changed = {**RESULT, 'content': 'different'}
     payload = wire([ASSISTANT, {'role': 'user', 'content': [changed]}])
     try:
         route = gate.url.removeprefix(f'http://127.0.0.1:{gate.server.server_port}') + '/v1/messages'

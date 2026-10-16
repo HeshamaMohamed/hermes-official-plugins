@@ -63,7 +63,7 @@ def test_probe_disconnect_does_not_print_a_traceback():
             # The relay must still be alive and able to serve the real request after the probe.
             import http.client
             conn = http.client.HTTPConnection(host, port, timeout=5)
-            conn.request('POST', gate.prefix + '/v1/messages', b'{}', {'Content-Length': '2'})
+            conn.request('POST', gate.prefix + '/v1/messages', b'{"messages":[]}', {'Content-Length': '15'})
             response = conn.getresponse()
             assert response.status == 200
             conn.close()

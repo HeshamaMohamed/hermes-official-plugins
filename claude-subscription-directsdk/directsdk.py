@@ -703,7 +703,7 @@ class Client:
                 mcp = {'mcpServers': {'hermes': {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}}}
                 env, resolved = self._native_env()
                 # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
+                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], system=system)
                 env['ANTHROPIC_BASE_URL'] = request.admission.url
                 # Native settings apply env inside the process, avoiding execve's
                 # per-argument/environment-string limit for full Hermes schemas.
@@ -818,6 +818,9 @@ class Client:
                 if request.cancelled.is_set():
                     raise RuntimeError('Claude request cancelled')
                 admission = request.admission
+                if admission.refused:
+                    # The one admitted request had to be this turn; a native side request is never the reply (ADR-0012).
+                    raise ClaudeAPIError(admission.refused)
                 if admission.used:
                     if admission.status != 200 or not admission.capture.complete:
                         # Native's last error is the admission denial; name the first attempt's outcome so reports are diagnosable.
@@ -986,6 +989,8 @@ class Client:
                         if capture.complete and capture.message.get('stop_reason') in ('tool_use', 'refusal'):
                             break
             admission = session.admission
+            if admission.refused:
+                raise ClaudeAPIError(admission.refused)
             if native_error_code == 'authentication_failed' and not admission.used:
                 raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error})')
             # Failures carry the status Hermes routes retry/fallback on, as in baseline (#58).
@@ -1074,7 +1079,8 @@ class Client:
             if admission is not None:
                 admission.abort()  # nothing is admitted after this, so `used` is final
             refused = isinstance(error, (ValueError, ClaudeCodeMissing, ClaudeCodeLoggedOut)) or (isinstance(error, ClaudeAPIError) and error.status_code is not None)
-            if yielded or refused or request.cancelled.is_set() or (admission is not None and admission.used):
+            # A refused side request recurs on a fresh native under the same environment: no per-call retry.
+            if yielded or refused or request.cancelled.is_set() or (admission is not None and (admission.used or admission.refused)):
                 raise
             _warm_log.info('warm fallback: session=%s per-call after %s', session.ident[:8] + ':' + str(session.pid), type(error).__name__)
             yield from self._run(request, kwargs, body, manifest, names, system, frames)
@@ -1091,7 +1097,7 @@ class Client:
         # A parked hermes tool call lasts as long as Hermes runs the tool; Hermes already bounds its output.
         env.update(MCP_TOOL_TIMEOUT='86400000', MAX_MCP_OUTPUT_TOKENS='100000000')
         # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-        session.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
+        session.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], system=system)
         # A live native keeps its launch context where it first put it; the relay moves it after the newest frame on
         # every request, where a fresh native replaying this history puts it, so a rebuild reads this native's cache.
         session.admission.float_context = True

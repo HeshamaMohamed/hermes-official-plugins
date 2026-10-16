@@ -101,7 +101,7 @@ def test_authenticated_connect_tunnels_to_the_upstream_host(clean_proxy_env):
     try:
         port = int(gate.url.split(':')[2].split('/')[0])
         conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
-        conn.request('POST', gate.prefix + '/v1/messages', b'{}',
+        conn.request('POST', gate.prefix + '/v1/messages', b'{"messages":[]}',
                      {'Content-Type': 'application/json', 'Authorization': 'Bearer subscription-secret'})
         try:
             conn.getresponse().read()
