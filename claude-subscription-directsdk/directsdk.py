@@ -337,9 +337,11 @@ class Request:
         self.lock = threading.Lock()
 
     def cancel(self):
-        self.cancelled.set()
-        if self.admission is not None:
-            self.admission.abort()
+        with self.lock:
+            self.cancelled.set()
+            admission = self.admission
+        if admission is not None:
+            admission.abort()
         with self.lock:
             if self.process is not None:
                 kill_process_tree(self.process)
