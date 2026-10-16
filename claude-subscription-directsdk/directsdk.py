@@ -907,6 +907,7 @@ class Client:
 
     def _run_warm(self, request, kwargs, body, manifest, names, system, frames):
         """One Hermes step on a live native session; any mismatch rebuilds it from the full history."""
+        hermes_names = {native: hermes for hermes, native in names.items()}
         started = time.monotonic()
         timeout = kwargs.get('timeout', self.timeout)
         timeout = getattr(timeout, 'read', timeout)
@@ -1010,12 +1011,13 @@ class Client:
                 if block.get('type') == 'tool_use':
                     # As baseline (#39, #62): a name outside the inventory goes to Hermes, a bare offered name carries
                     # the prefix. Native parks neither on the hermes MCP server, so the session cannot continue.
-                    if block['name'] in names:
+                    if block['name'] in hermes_names:
                         block['name'] = PREFIX + block['name']
                         poisoned = True
-                    elif not block['name'].startswith(PREFIX) or block['name'][len(PREFIX):] not in names:
+                    elif not block['name'].startswith(PREFIX) or block['name'][len(PREFIX):] not in hermes_names:
                         poisoned = True
-                    calls.append({'id': block['id'], 'type': 'function', 'function': {'name': block['name'].removeprefix(PREFIX), 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                    name = block['name'].removeprefix(PREFIX)
+                    calls.append({'id': block['id'], 'type': 'function', 'function': {'name': hermes_names.get(name, name), 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
             usage = assistant['usage']
             text = ''.join(b.get('text', '') for b in blocks if b.get('type') == 'text')
             if emitted != text:

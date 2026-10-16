@@ -129,6 +129,8 @@ for line in sys.stdin:
         out({'type':'control_response','response':{'subtype':'success','request_id':row['request_id'],'response':{}}})
         out({'type':'control_request','request_id':'list','request':{'subtype':'mcp_message','server_name':'hermes','message':{'jsonrpc':'2.0','id':0,'method':'tools/list'}}})
     elif row['type'] == 'control_response' and row['response']['request_id'] == 'list':
+        with open(os.environ['SPAWNS'] + '.tools', 'a') as f:
+            f.write(json.dumps(row['response']['response']['mcp_response']['result']['tools']) + '\n')
         # Without _meta an MCP tool persists past min(100,000, 50,000); _meta counts up to the 500,000 ceiling.
         for tool in row['response']['response']['mcp_response']['result']['tools']:
             meta = (tool.get('_meta') or {}).get('anthropic/maxResultSizeChars')
@@ -181,6 +183,7 @@ class Upstream:
     """Answers the newest native message: a user text asks for two parallel probe calls, tool results get echoed."""
     def __init__(self, hang=None):
         self.bodies, self.hang, self.release = [], hang or threading.Event(), threading.Event()
+        self.reply = None
         outer = self
         class Peer(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -222,6 +225,8 @@ class Upstream:
                                             {'type': 'tool_use', 'id': f'toolu_{n}b', 'name': 'mcp__hermes__probe', 'input': {'key': 'b'}}], 'tool_use')
                 else:
                     payload = sse(f'm{n}', [{'type': 'text', 'text': 'echo ' + content[0].get('text', '')}], 'end_turn')
+                if outer.reply:
+                    payload = outer.reply(n, body)
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.end_headers()
@@ -253,7 +258,9 @@ def warm(tmp_path):
         return clients[-1]
     def spawned():
         return [json.loads(line) for line in spawns.read_text().splitlines()] if spawns.exists() else []
-    yield SimpleFixture(client, spawned, upstream)
+    fixture = SimpleFixture(client, spawned, upstream)
+    fixture.manifests = lambda: [json.loads(line) for line in Path(str(spawns) + '.tools').read_text().splitlines()]
+    yield fixture
     for c in clients:
         c.close()
     directsdk._warm_shutdown()
@@ -287,6 +294,33 @@ def alive(pid):
         return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
+
+@pytest.mark.parametrize('bare', [False, True])
+def test_warm_long_tool_name_round_trips_and_retains_session(warm, bare):
+    name = 'public_probe_' + 'x' * 48
+    tools = [{'type': 'function', 'function': {'name': name}}]
+    encoded, manifest, names = directsdk.request_body({'tools': tools})
+    alias = names[name]
+    native_name = alias if bare else directsdk.PREFIX + alias
+    warm.upstream.reply = lambda n, body: sse(f'm{n}', [
+        {'type': 'tool_use', 'id': f'toolu_{n}', 'name': native_name, 'input': {}}
+    ], 'tool_use') if n == 1 else sse(f'm{n}', [{'type': 'text', 'text': 'done'}], 'end_turn')
+    history = [{'role': 'user', 'content': 'long-tool'}]
+    client = warm.client()
+    first = client.create(model='sonnet', messages=history, tools=tools)
+    call = first.choices[0].message.tool_calls[0]
+    assert call.function.name == name
+    assert first.choices[0].message.reasoning_details[0]['messages'][0]['content'][0]['name'] == directsdk.PREFIX + alias
+    history += [as_history(first), {'role': 'tool', 'tool_call_id': call.id, 'content': 'public result'}]
+    second = client.create(model='sonnet', messages=history, tools=tools)
+    # A bare call is repaired for replay, but native did not park it on the MCP server.
+    assert second.usage.native_admission.warm == ('cold' if bare else 'reused')
+    assert second.choices[0].message.content == 'done'
+    assert len(warm.spawned()) == (2 if bare else 1)
+    advertised = warm.manifests()[0]
+    assert [{k: v for k, v in t.items() if k != '_meta'} for t in advertised] == manifest
+    assert json.loads(encoded)['tools'][0]['name'] == directsdk.PREFIX + advertised[0]['name']
+
 
 
 def test_one_native_serves_tool_rounds_and_turns_with_hermes_results(warm):
